@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo build *)",
+      "Bash(curl -s \"https://raw.githubusercontent.com/WFCD/warframe-items/master/data/json/Warframes.json\")",
+      "Bash(python3 -c \"import json,sys; data=json.load\\(sys.stdin\\); item=data[0]; print\\('keys:', list\\(item.keys\\(\\)\\)[:15]\\); comps=item.get\\('components',[]\\); print\\('components count:', len\\(comps\\)\\); print\\('first comp keys:', list\\(comps[0].keys\\(\\)\\) if comps else 'none'\\)\")",
+      "Bash(python3 -c \" import json,sys data=json.load\\(sys.stdin\\) item=data[0] print\\('parent uniqueName:', item['uniqueName']\\) print\\('parent name:', item['name']\\) for c in item.get\\('components',[]\\): print\\(' comp:', c.get\\('uniqueName'\\), '|', c.get\\('name'\\), '| count:', c.get\\('itemCount'\\)\\) \")",
+      "Bash(curl -s \"https://raw.githubusercontent.com/WFCD/warframe-items/master/data/json/Pets.json\")",
+      "Bash(python3 -c ' *)"
+    ]
+  }
+}
