@@ -39,7 +39,7 @@ This is a fair question whenever an app reads game memory. Here is exactly what 
 
 Digital Extremes has publicly confirmed that read-only memory tools (used by Overwolf, Warframe Companion, etc.) are acceptable. FrameForge follows the same approach.
 
-**Don't take our word for it** — the full source code is in this repository under GPLv3. You can read every line, build it yourself, and verify exactly what it does.
+**Don't take our word for it** — the full source code is in this repository under GPLv3. You can read every line, build it yourself, and verify exactly what it does. The distributed `.exe` contains minified frontend code (standard build practice), but the source here is the authoritative, readable version.
 
 ---
 

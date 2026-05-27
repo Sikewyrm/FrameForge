@@ -51,16 +51,16 @@ if %errorlevel% neq 0 (
 :: Push source code to GitHub before building
 echo Pushing source code to GitHub...
 git add -A
-git diff --cached --quiet
-if %errorlevel% neq 0 (
-    git commit -m "Release !TAG!"
-    git push origin main
-    if %errorlevel% neq 0 (
-        echo ERROR: git push failed. Check your remote and credentials.
-        pause & exit /b 1
-    )
-) else (
-    echo No source changes to commit, skipping push.
+git commit -m "Release !TAG!" 2>nul || echo Nothing new to commit.
+git pull origin main --rebase
+if !errorlevel! neq 0 (
+    echo ERROR: git pull failed. Resolve conflicts manually and try again.
+    pause & exit /b 1
+)
+git push origin main
+if !errorlevel! neq 0 (
+    echo ERROR: git push failed. Check your remote and credentials.
+    pause & exit /b 1
 )
 echo.
 
