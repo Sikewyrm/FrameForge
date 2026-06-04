@@ -1,0 +1,269 @@
+.riven-analyzer {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 14px;
+  height: 100%;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+/* ── Header ── */
+.riven-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.riven-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.riven-roll-count {
+  font-size: 11px;
+  font-weight: 700;
+  background: rgba(56,139,253,.15);
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  padding: 1px 8px;
+  border-radius: 10px;
+}
+
+.riven-db-status {
+  font-size: 10px;
+  color: var(--muted);
+  margin-left: auto;
+}
+
+.riven-check-btn {
+  background: rgba(56,139,253,.15);
+  border: 1px solid rgba(56,139,253,.4);
+  color: #58a6ff;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 4px 10px;
+  border-radius: 5px;
+  transition: background .15s;
+}
+.riven-check-btn:hover { background: rgba(56,139,253,.28); }
+
+.riven-refresh-btn {
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 14px;
+  cursor: pointer;
+  padding: 0 2px;
+  transition: color .1s;
+}
+.riven-refresh-btn:hover { color: var(--text); }
+
+/* ── Weapon search ── */
+.riven-weapon-wrap {
+  position: relative;
+  flex-shrink: 0;
+}
+
+.riven-weapon-input {
+  width: 100%;
+  background: rgba(0,0,0,.2);
+  border: 1px solid rgba(48,54,61,.8);
+  border-radius: 5px;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  padding: 7px 10px;
+  outline: none;
+  box-sizing: border-box;
+}
+.riven-weapon-input:focus { border-color: var(--accent); }
+
+.riven-suggestions {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  background: var(--surface);
+  border: 1px solid rgba(48,54,61,.8);
+  border-top: none;
+  border-radius: 0 0 5px 5px;
+  z-index: 10;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.riven-suggestion {
+  padding: 6px 10px;
+  font-size: 12px;
+  color: var(--text);
+  cursor: pointer;
+  transition: background .1s;
+}
+.riven-suggestion:hover { background: rgba(56,139,253,.12); }
+
+/* ── Section label ── */
+.riven-section-label {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  color: var(--muted);
+  flex-shrink: 0;
+}
+
+.riven-optional {
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: 0;
+  font-style: italic;
+}
+
+/* ── Stat picker grid ── */
+.riven-stat-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.riven-stat-btn {
+  background: rgba(255,255,255,.05);
+  border: 1px solid rgba(48,54,61,.6);
+  color: var(--muted);
+  font-size: 11px;
+  padding: 3px 9px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background .1s, color .1s, border-color .1s;
+  white-space: nowrap;
+}
+.riven-stat-btn:hover { background: rgba(255,255,255,.1); color: var(--text); }
+
+.riven-stat-btn.selected {
+  background: rgba(63,185,80,.15);
+  border-color: var(--green);
+  color: var(--green);
+}
+
+.riven-neg-btn.selected-neg {
+  background: rgba(248,81,73,.15);
+  border-color: var(--red);
+  color: var(--red);
+}
+
+/* ── Analysis result ── */
+.riven-result {
+  background: rgba(255,255,255,.03);
+  border: 1px solid rgba(48,54,61,.5);
+  border-radius: 8px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+.riven-verdict {
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: .01em;
+}
+
+/* ── Score bar ── */
+.riven-score-bar-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 6px;
+  background: rgba(255,255,255,.08);
+  border-radius: 3px;
+  overflow: visible;
+  position: relative;
+}
+
+.riven-score-bar {
+  height: 6px;
+  border-radius: 3px;
+  transition: width .3s, background .3s;
+  min-width: 4px;
+}
+
+.riven-score-pct {
+  font-size: 11px;
+  font-weight: 700;
+  position: absolute;
+  right: 0;
+  top: -2px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Stat breakdown rows ── */
+.riven-stats-breakdown {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.riven-stat-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  padding: 3px 0;
+}
+
+.riven-stat-icon {
+  width: 14px;
+  text-align: center;
+  flex-shrink: 0;
+  font-size: 11px;
+}
+
+.riven-stat-tag {
+  margin-left: auto;
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+
+.riven-stat-good   { color: var(--green); }
+.riven-stat-good   .riven-stat-tag { background: rgba(63,185,80,.12); color: var(--green); }
+
+.riven-stat-miss   { color: var(--muted); }
+.riven-stat-miss   .riven-stat-tag { background: rgba(255,255,255,.06); color: var(--muted); }
+
+.riven-stat-safe   { color: #6eb6ff; }
+.riven-stat-safe   .riven-stat-tag { background: rgba(110,182,255,.12); color: #6eb6ff; }
+
+.riven-stat-bad    { color: var(--red); }
+.riven-stat-bad    .riven-stat-tag { background: rgba(248,81,73,.12); color: var(--red); }
+
+/* ── Notes ── */
+.riven-notes {
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.5;
+  border-top: 1px solid rgba(48,54,61,.4);
+  padding-top: 8px;
+}
+
+/* ── Next roll button ── */
+.riven-next-roll-btn {
+  background: rgba(56,139,253,.12);
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 7px 16px;
+  border-radius: 5px;
+  cursor: pointer;
+  align-self: flex-start;
+  transition: background .1s;
+  flex-shrink: 0;
+}
+.riven-next-roll-btn:hover { background: rgba(56,139,253,.25); }

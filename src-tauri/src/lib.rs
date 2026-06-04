@@ -1057,6 +1057,980 @@ async fn wfm_set_status(state: State<'_, AppState>, status: String) -> Result<()
     .map_err(|e| format!("Task: {}", e))?
 }
 
+// ─── Riven database ───────────────────────────────────────────────────────────
+
+static RIVEN_ABBREVIATIONS: &[(&str, &str)] = &[
+    ("CD",    "Critical Damage"),
+    ("CC",    "Critical Chance"),
+    ("MS",    "Multishot"),
+    ("DMG",   "Base Damage"),
+    ("FR",    "Fire Rate"),
+    ("SC",    "Status Chance"),
+    ("TOX",   "Toxicity"),
+    ("HEAT",  "Heat"),
+    ("ELEC",  "Electricity"),
+    ("COLD",  "Cold"),
+    ("PT",    "Punch Through"),
+    ("RLS",   "Reload Speed"),
+    ("MAG",   "Magazine Size"),
+    ("AMMO",  "Ammo Maximum"),
+    ("ZOOM",  "Zoom"),
+    ("REC",   "Recoil"),
+    ("SLASH", "Slash"),
+    ("PUNC",  "Puncture"),
+    ("IMP",   "Impact"),
+    ("PFS",   "Projectile Flight Speed"),
+    ("SD",    "Status Duration"),
+    ("DTI",   "Damage to Infested"),
+    ("DTG",   "Damage to Grineer"),
+    ("DTC",   "Damage to Corpus"),
+    ("RLS",   "Reload Speed"),
+    ("AS",    "Attack Speed"),
+    ("RANGE", "Range"),
+    ("IC",    "Initial Combo"),
+    ("CC",    "Combo Count Chance"),
+    ("EFF",   "Heavy Attack Efficiency"),
+    ("SLIDE", "Slide Critical Chance"),
+    ("FIN",   "Finisher Damage"),
+    ("HA",    "Heavy Attack Damage"),
+    ("SLAM",  "Slam Attack"),
+];
+
+/// Expand all-caps abbreviations in a notes string using the abbreviations table.
+/// "PUNC gives 5%CC" → "Puncture gives 5% Critical Chance"
+fn expand_abbrevs_in_notes(notes: &str) -> String {
+    let bytes = notes.as_bytes();
+    let mut result = String::with_capacity(notes.len() * 2);
+    let mut last = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_uppercase() {
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_uppercase() {
+                i += 1;
+            }
+            // Only expand if surrounded by non-alphabetic chars (word boundary)
+            let prev_alpha = start > 0 && bytes[start - 1].is_ascii_alphabetic();
+            let next_alpha = i < bytes.len() && bytes[i].is_ascii_alphabetic();
+            if !prev_alpha && !next_alpha {
+                let word = &notes[start..i];
+                if let Some((_, full)) = RIVEN_ABBREVIATIONS.iter().find(|(a, _)| *a == word) {
+                    result.push_str(&notes[last..start]);
+                    result.push_str(full);
+                    last = i;
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    result.push_str(&notes[last..]);
+    result
+}
+
+fn riven_abbrev_to_full(abbrev: &str) -> String {
+    let up = abbrev.trim().to_uppercase();
+    RIVEN_ABBREVIATIONS.iter()
+        .find(|(a, _)| *a == up.as_str())
+        .map(|(_, f)| f.to_string())
+        .unwrap_or_else(|| abbrev.to_string())
+}
+
+/// Parse spreadsheet stat string into slot groups.
+/// Space-separated tokens = each is its own required slot.
+/// Slash-separated tokens = any one of these fills that slot.
+/// "CD MS/TOX/DMG/FR/CC" → [[CD], [MS, TOX, DMG, FR, CC]]  (2 groups)
+/// "CD AS RANGE"          → [[CD], [AS], [RANGE]]            (3 groups, all required)
+/// "CC MS FR/CD/DMG/HEAT" → [[CC], [MS], [FR, CD, DMG, HEAT]] (3 groups)
+/// Multiple "or" paths are merged: all unique groups across all alternatives.
+fn parse_stat_groups(s: &str) -> Vec<Vec<String>> {
+    let without_note = s.split('(').next().unwrap_or(s);
+    let mut all_groups: Vec<Vec<String>> = Vec::new();
+    for alt in without_note.split(" or ") {
+        for token in alt.split_whitespace() {
+            let options: Vec<String> = token.split('/')
+                .filter_map(|t| { let t = t.trim(); if t.is_empty() { None } else { Some(riven_abbrev_to_full(t)) } })
+                .collect();
+            if !options.is_empty() {
+                // Avoid duplicating groups that appear in multiple alternatives
+                if !all_groups.iter().any(|g| g == &options) {
+                    all_groups.push(options);
+                }
+            }
+        }
+    }
+    all_groups
+}
+
+/// Flat dedup list of all stats across all groups — kept for backwards compat where needed.
+fn parse_riven_stat_str(s: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    for group in parse_stat_groups(s) {
+        for stat in group {
+            if !result.contains(&stat) { result.push(stat); }
+        }
+    }
+    result
+}
+
+fn csv_split_line(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut cur = String::new();
+    let mut in_q = false;
+    for ch in line.chars() {
+        match ch {
+            '"' => in_q = !in_q,
+            ',' if !in_q => { fields.push(cur.trim().to_string()); cur = String::new(); }
+            c => cur.push(c),
+        }
+    }
+    fields.push(cur.trim().to_string());
+    fields
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct RivenEntry {
+    pub weapon: String,
+    /// Each inner Vec is one "slot group":
+    ///   - [single stat]    = required (space-separated in spreadsheet)
+    ///   - [A, B, C, ...]   = any one of these fills this slot (/-separated)
+    /// "CD MS/TOX/DMG" → [[CD], [MS, TOX, DMG]]
+    pub stat_groups: Vec<Vec<String>>,
+    pub safe_negatives: Vec<String>,
+    pub notes: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct RivenAnalysis {
+    pub weapon: String,
+    pub matched_positives: Vec<String>,
+    pub missing_positives: Vec<String>,
+    pub safe_negatives_present: Vec<String>,
+    pub harmful_negatives: Vec<String>,
+    pub total_wanted: usize,
+    pub score: f32,
+    pub verdict: String,
+    pub notes: String,
+}
+
+static RIVEN_DB: std::sync::OnceLock<std::sync::Mutex<HashMap<String, RivenEntry>>> =
+    std::sync::OnceLock::new();
+
+fn get_riven_db() -> &'static std::sync::Mutex<HashMap<String, RivenEntry>> {
+    RIVEN_DB.get_or_init(|| {
+        std::sync::Mutex::new(load_riven_csv_from_url().unwrap_or_default())
+    })
+}
+
+const RIVEN_SHEET_ID: &str = "1zbaeJBuBn44cbVKzJins_E3hTDpnmvOk8heYN-G8yy8";
+// Tabs: 0=primary, 1505239276=secondary, 1413904270=melee, 289737427=archwing, 965095749=other
+// 1687910063 is the legend/info page — skip it
+const RIVEN_SHEET_GIDS: &[u64] = &[0, 1505239276, 1413904270, 289737427, 965095749];
+
+fn load_riven_csv_from_url() -> Result<HashMap<String, RivenEntry>, String> {
+    let mut combined = HashMap::new();
+    for &gid in RIVEN_SHEET_GIDS {
+        let url = format!(
+            "https://docs.google.com/spreadsheets/d/{}/export?format=csv&gid={}",
+            RIVEN_SHEET_ID, gid
+        );
+        match ureq::get(&url)
+            .set("User-Agent", "FrameForge/1.4.2")
+            .call().map_err(|e| e.to_string())
+            .and_then(|r| r.into_string().map_err(|e| e.to_string()))
+        {
+            Ok(csv) => { combined.extend(parse_riven_csv(&csv)); }
+            Err(e) => { eprintln!("[riven] Failed to load gid={}: {}", gid, e); }
+        }
+    }
+    if combined.is_empty() {
+        return Err("No riven data loaded from any sheet tab".into());
+    }
+    Ok(combined)
+}
+
+fn parse_riven_csv(csv: &str) -> HashMap<String, RivenEntry> {
+    let mut map = HashMap::new();
+    let mut lines = csv.lines();
+
+    // Read header to find which column holds "NEGATIVE STATS:" — it varies by tab
+    let header = match lines.next() { Some(h) => h, None => return map };
+    let hf = csv_split_line(header);
+    let neg_col = hf.iter().position(|c| c.trim().to_lowercase().contains("negative")).unwrap_or(5);
+    let notes_col = hf.iter().position(|c| c.trim().to_lowercase().contains("note")).unwrap_or(8);
+
+    for line in lines {
+        let f = csv_split_line(line);
+        if f.len() < neg_col + 1 { continue; }
+        let weapon = f[0].trim().to_lowercase();
+        if weapon.is_empty() { continue; }
+        let stat_groups = parse_stat_groups(&f[1]);
+        let safe_neg    = parse_riven_stat_str(&f[neg_col]);
+        let raw_notes   = f.get(notes_col).map(|s| s.trim().trim_matches('"').to_string()).unwrap_or_default();
+        let notes       = expand_abbrevs_in_notes(&raw_notes);
+        map.insert(weapon.clone(), RivenEntry { weapon, stat_groups, safe_negatives: safe_neg, notes });
+    }
+    map
+}
+
+/// Like ocr_stat_to_full but first tries the full conditional name, then strips "for X" and retries.
+/// "Critical Chance for Slide Attack" → "Slide Critical Chance" (full wins)
+/// "Critical Damage for Slide Attack" → stripped → "Critical Damage" (full doesn't match, fallback)
+fn ocr_stat_to_full_with_condition(ocr_name: &str) -> String {
+    let full_try = ocr_stat_to_full(ocr_name);
+    if full_try != ocr_name {
+        return full_try; // matched on full name
+    }
+    // Strip "for <condition>" and try again
+    let stripped = ocr_name.split(" for ").next().unwrap_or(ocr_name).trim();
+    if stripped != ocr_name {
+        let stripped_try = ocr_stat_to_full(stripped);
+        if stripped_try != stripped {
+            return stripped_try;
+        }
+    }
+    full_try // return best effort even if unrecognized
+}
+
+/// In-game stat names → database full names (handles abbreviations and element icons stripped by OCR)
+fn ocr_stat_to_full(ocr_name: &str) -> String {
+    // Strip leading OCR artifacts from element icons (e.g. "61-leat" → "leat" from 🔥Heat,
+    // "ld" from ❄Cold, etc.) before pattern matching.
+    let stripped = ocr_name.trim().trim_start_matches(|c: char| !c.is_alphabetic());
+    let n = stripped.to_lowercase();
+    match n.as_str() {
+        // Conditional melee stats — checked FIRST so "critical chance for slide attack" wins
+        // over the generic "critical chance" pattern below
+        s if s.contains("critical chance") && (s.contains("slide") || s.contains("slide attack")) => "Slide Critical Chance",
+        s if s.contains("critical chance") && s.contains("aerial") => "Aerial Critical Chance",
+        s if s.contains("critical chance") && s.contains("wall") => "Wall Critical Chance",
+        s if s.contains("critical damage") || s.contains("crit. damage") || s.contains("crit damage") => "Critical Damage",
+        s if s.contains("critical chance") || s.contains("crit. chance") || s.contains("crit chance") => "Critical Chance",
+        s if s.contains("multishot") => "Multishot",
+        s if s.contains("fire rate") => "Fire Rate",
+        s if s.contains("status chance") => "Status Chance",
+        s if s.contains("base damage") || (s.contains("damage") && !s.contains("critical") && !s.contains("infested") && !s.contains("grineer") && !s.contains("corpus")) => "Base Damage",
+        // Toxin — icon may eat 'T', leaving "oxin" or "oxicity"
+        s if s.contains("toxin") || s.contains("toxicity") || s.starts_with("oxin") => "Toxicity",
+        // Heat — fire icon may eat 'H', leaving "eat" or "leat"
+        s if s.contains("heat") || s.contains("fire damage")
+            || s == "eat" || s == "leat" || (s.ends_with("eat") && s.len() <= 7) => "Heat",
+        // Electricity — icon may eat 'E', leaving "lectricity" etc.
+        s if s.contains("electricity") || s.contains("electric") || s.starts_with("lectr") => "Electricity",
+        // Cold — ice icon may eat 'C', leaving "old"
+        s if s.contains("cold") || s.contains("freeze") || s == "old" => "Cold",
+        s if s.contains("punch through") => "Punch Through",
+        s if s.contains("reload speed") || s.contains("reload") => "Reload Speed",
+        s if s.contains("magazine size") || s.contains("magazine") || s.contains("mag size") => "Magazine Size",
+        s if s.contains("ammo max") || s.contains("ammo maximum") => "Ammo Maximum",
+        s if s.contains("zoom") => "Zoom",
+        s if s.contains("recoil") => "Recoil",
+        s if s.contains("slash") => "Slash",
+        s if s.contains("puncture") => "Puncture",
+        s if s.contains("impact") => "Impact",
+        s if s.contains("flight speed") || s.contains("proj. flight") || s.contains("projectile") => "Projectile Flight Speed",
+        s if s.contains("status duration") => "Status Duration",
+        s if s.contains("infested") => "Damage to Infested",
+        s if s.contains("grineer") => "Damage to Grineer",
+        s if s.contains("corpus") => "Damage to Corpus",
+        // Melee-specific stats
+        s if s.contains("attack speed") || s.contains("attack spd") => "Attack Speed",
+        s if s.contains("combo duration") => "Combo Duration",
+        s if s.contains("combo count") => "Combo Count Chance",
+        s if s.contains("heavy attack") && s.contains("efficiency") => "Heavy Attack Efficiency",
+        s if s.contains("heavy attack") => "Heavy Attack Damage",
+        s if s.contains("slam") => "Slam Attack",
+        s if s.contains("slide") && s.contains("crit") => "Slide Critical Chance",
+        s if s.contains("range") => "Range",
+        _ => return ocr_name.to_string(),
+    }.to_string()
+}
+
+/// Parse stat lines from a card's OCR text, returning rolled_stats JSON array.
+fn parse_original_stats(text: Option<&str>) -> Vec<serde_json::Value> {
+    let Some(text) = text else { return vec![]; };
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let l = line.trim();
+        if l.to_lowercase().starts_with('x') && l.len() > 2 && l.chars().nth(1).map_or(false, |c| c.is_ascii_digit() || c == ' ') {
+            let alpha_start = l.find(|c: char| c.is_alphabetic() && c != 'x').unwrap_or(l.len());
+            let val = l[..alpha_start].split_whitespace().collect::<Vec<_>>().join("");
+            let name_part = l[alpha_start..].trim().split(" (").next().unwrap_or("").trim();
+            if !name_part.is_empty() {
+                out.push(serde_json::json!({"name": ocr_stat_to_full_with_condition(name_part), "value": val, "positive": true}));
+            }
+            continue;
+        }
+        let fc = l.chars().next().unwrap_or(' ');
+        let (is_pos, part) = if l.starts_with('+') { (true, l.trim_start_matches('+')) }
+                             else if l.starts_with('-') { (false, l.trim_start_matches('-')) }
+                             else if "•·○●◦".contains(fc) { (true, l.trim_start_matches(|c: char| "•·○●◦".contains(c))) }
+                             else { continue; };
+        let val = if part.contains('%') {
+            let n = part.split('%').next().unwrap_or("").trim();
+            format!("{}{}%", if is_pos { "+" } else { "-" }, n)
+        } else {
+            let e = part.find(|c: char| !c.is_ascii_digit() && c != '.').unwrap_or(part.len());
+            format!("{}{}%", if is_pos { "+" } else { "-" }, &part[..e])
+        };
+        let sname: &str = if let Some(a) = part.splitn(2, '%').nth(1) { a.trim() }
+                          else { let e = part.find(|c: char| c.is_alphabetic()).unwrap_or(0);
+                                 part[e..].trim_start_matches(|c: char| !c.is_alphabetic()) };
+        if sname.is_empty() { continue; }
+        let sname = sname.trim_start_matches(|c: char| !c.is_alphabetic());
+        let sname = sname.split(" (").next().unwrap_or(sname).trim();
+        out.push(serde_json::json!({"name": ocr_stat_to_full_with_condition(sname), "value": val, "positive": is_pos}));
+    }
+    out
+}
+
+/// Capture the riven reroll screen and OCR the stats + weapon name.
+/// Returns (weapon_name, positives, negatives).
+#[tauri::command]
+async fn ocr_riven_screen() -> Result<serde_json::Value, String> {
+    let riven_log = std::env::temp_dir().join("frameforge_riven_session.txt");
+    let ts1 = chrono::Local::now().format("%H:%M:%S%.3f").to_string();
+
+    let _ = append_to_file(&riven_log, &format!(
+        "[STEP 2] OCR STARTED — {}\n\
+         ├─ Capture region : y 0%–75% (header + card + FITS IN panel)\n\
+         └─ Validating: expects \"INVENTORY/MODS\" at top + \"FITS IN\" on right\n",
+        ts1
+    ));
+
+    // Capture y 0–0.75: includes the "INVENTORY / MODS" header at the top and the
+    // "FITS IN" weapon panel on the right. We retry until both markers are visible —
+    // this filters out false EE.log triggers and handles slow screen transitions.
+    const MAX_ATTEMPTS: u32 = 6;
+    const RETRY_MS: u64 = 350;
+
+    let mut text = String::new();
+    let mut full_text_for_fallback = String::new();
+    let mut confirmed = false;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(RETRY_MS)).await;
+        }
+
+        let riven_log2 = riven_log.clone();
+        // One PrintWindow capture; two OCR passes from the same pixels:
+        //   • Full width (0–100%) for validation markers ("INVENTORY/MODS" + "FITS IN")
+        //   • Card column only (20–65%) for stat parsing — excludes the right panel whose
+        //     "FITS IN" / weapon label text can interfere with reading the card's bottom stats.
+        let attempt_result = tokio::task::spawn_blocking(move || {
+            let ts = chrono::Local::now().format("%H:%M:%S%.3f").to_string();
+            let px = ocr::capture_warframe_pixels().map_err(|e| format!("Capture: {}", e))?;
+            let (pixels, w, h) = px;
+            let full_text = ocr::ocr_pixels_rect(&pixels, w, h, 0.0, 1.0, 0.0, 0.82)
+                .unwrap_or_default();
+            let card_text = ocr::ocr_pixels_rect(&pixels, w, h, 0.20, 0.65, 0.28, 0.82)
+                .unwrap_or_default();
+            let _ = append_to_file(&riven_log2, &format!(
+                "[STEP 2] OCR attempt {} — {}\n├─ Full text:\n{}\n└─ Card text:\n{}\n\n",
+                attempt + 1, ts, full_text, card_text
+            ));
+            Ok::<_, String>((full_text, card_text))
+        }).await.map_err(|e| format!("Task: {}", e))??;
+
+        let (full_text, card_text) = attempt_result;
+        let lower = full_text.to_lowercase();
+        let has_header  = lower.contains("inventory") || lower.contains("mods");
+        let has_fits_in = lower.contains("fits in");
+
+        let _ = append_to_file(&riven_log, &format!(
+            "[STEP 2] attempt {} — header={} fits_in={}\n",
+            attempt + 1, has_header, has_fits_in
+        ));
+
+        // Count stat lines in card_text — 5+ means comparison mode (two cards visible).
+        // In comparison mode the "FITS IN" panel shifts and may not OCR correctly.
+        // Accept header-only confirmation when we already see enough stat lines.
+        let stat_count = card_text.lines()
+            .filter(|l| { let t = l.trim(); t.starts_with('+') || t.starts_with('-') })
+            .count();
+        let comparison_likely = stat_count >= 5;
+
+        if (has_header && has_fits_in) || (has_header && comparison_likely) {
+            text = card_text;
+            full_text_for_fallback = full_text;
+            confirmed = true;
+            if comparison_likely && !has_fits_in {
+                let _ = append_to_file(&riven_log, &format!(
+                    "[STEP 2] Comparison mode early-confirm ({} stat lines, no FITS IN)\n", stat_count
+                ));
+            }
+            break;
+        }
+        text = card_text;
+        full_text_for_fallback = full_text;
+    }
+
+    if !confirmed {
+        let _ = append_to_file(&riven_log, "[STEP 2] Screen markers not confirmed after all attempts — proceeding with last OCR result anyway\n\n");
+    }
+
+    // Detect comparison mode: >4 stat lines means two cards are visible (3–4 stats each).
+    // A riven can have at most 4 stats (3 pos + 1 neg), so 5+ total implies 2 cards.
+    let stat_line_count = text.lines()
+        .filter(|l| { let t = l.trim(); t.starts_with('+') || t.starts_with('-') })
+        .count();
+    let is_comparison = stat_line_count > 4;
+
+    if is_comparison {
+        let _ = append_to_file(&riven_log, &format!(
+            "[STEP 2] COMPARISON MODE detected ({} stat lines) — capturing card columns separately\n", stat_line_count
+        ));
+    }
+
+    // In comparison mode: one PrintWindow capture, OCR left and right card columns.
+    // Original card is ALWAYS on the left; new roll is always on the right.
+    // Card area x 20–65% is split roughly in half: left=20–42%, right=42–65%.
+    let (left_text, right_text) = if is_comparison {
+        let riven_log3 = riven_log.clone();
+        let cols = tokio::task::spawn_blocking(move || {
+            match ocr::capture_warframe_pixels() {
+                Ok((px, w, h)) => {
+                    // Wider y range to catch element-icon stat lines near card bottom
+                    let left  = ocr::ocr_pixels_rect(&px, w, h, 0.18, 0.44, 0.25, 0.84).unwrap_or_default();
+                    let right = ocr::ocr_pixels_rect(&px, w, h, 0.44, 0.68, 0.25, 0.84).unwrap_or_default();
+                    let _ = append_to_file(&riven_log3, &format!(
+                        "[STEP 2] Original (left):\n{}\n\nNew roll (right):\n{}\n\n", left, right
+                    ));
+                    (left, right)
+                }
+                Err(e) => {
+                    let _ = append_to_file(&riven_log3, &format!("[STEP 2] Column capture failed: {}\n", e));
+                    (String::new(), String::new())
+                }
+            }
+        }).await.map_err(|e| format!("Task: {}", e))?;
+        cols
+    } else {
+        (String::new(), String::new())
+    };
+
+    // Which text to parse for the new roll:
+    // - Comparison mode: right column = new roll, left column = original
+    // - Single card mode: card column text; fall back to full text if card column had no stats
+    let card_has_stats = text.lines().any(|l| { let t = l.trim(); t.starts_with('+') || t.starts_with('-') });
+    let parse_text = if is_comparison && !right_text.is_empty() {
+        &right_text
+    } else if !card_has_stats && !full_text_for_fallback.is_empty() {
+        // Card column empty — fall back to the full-width validated text
+        let _ = append_to_file(&riven_log, "[STEP 2] Card column had no stats — using full-width text as fallback\n");
+        &full_text_for_fallback
+    } else {
+        &text
+    };
+    let original_parse_text = if is_comparison && !left_text.is_empty() { Some(left_text.as_str()) } else { None };
+
+    // Parse weapon name.
+    // In the unveil screen "FITS IN" appears on its own line, weapon name on the next line.
+    // In the reroll screen the mod name is "WeaponName RivenIdentifier" (e.g. "Hirudo Geli-plecinus").
+    let lines: Vec<&str> = parse_text.lines().collect();
+
+    // Helper: try to match a candidate string against the riven DB, trying word-prefix
+    // substrings from longest to shortest (handles "Dual Cleavers Cronitron" → "dual cleavers").
+    let find_in_db = |candidate: &str| -> Option<String> {
+        let db = get_riven_db().lock().unwrap_or_else(|e| e.into_inner());
+        let words: Vec<&str> = candidate.split_whitespace().collect();
+        // Try 4-word prefix, then 3, 2, 1
+        for len in (1..=words.len().min(4)).rev() {
+            let prefix = words[..len].join(" ");
+            if db.contains_key(&prefix) {
+                return Some(prefix);
+            }
+        }
+        None
+    };
+
+    let weapon = lines.iter().enumerate()
+        .find(|(_, l)| l.to_lowercase().contains("fits in"))
+        .and_then(|(i, _)| lines.get(i + 1))
+        .and_then(|l| {
+            let lc = l.trim().to_lowercase();
+            find_in_db(&lc).or(Some(lc))
+        })
+        // Fallback: first non-stat, non-UI line is the mod name "WeaponName RivenId".
+        // Only accept if it matches a weapon in the DB — avoids returning currency values
+        // like "D '5,598" (Endo count) that pass the basic filter.
+        .or_else(|| {
+            lines.iter()
+                .find_map(|l| {
+                    let lt = l.trim().to_lowercase();
+                    if lt.is_empty() { return None; }
+                    // Skip obvious UI noise
+                    if lt.contains("fits in") || lt.contains("cycle") || lt.contains("kuva")
+                    || lt.contains("mr ") || lt.contains("inventory") || lt.contains("mods")
+                    || lt.contains("remaining") || lt.contains("show ranked") || lt.contains("cancel")
+                    || lt.starts_with('+') || lt.starts_with('-') || lt.starts_with('x')
+                    || lt.chars().next().map_or(false, |c| c.is_ascii_digit())
+                    // Skip lines that look like currency values (contain digit+comma or digit+apostrophe)
+                    || (lt.contains(',') && lt.chars().any(|c| c.is_ascii_digit()))
+                    || (lt.contains('\'') && lt.chars().any(|c| c.is_ascii_digit()))
+                    {
+                        return None;
+                    }
+                    find_in_db(&lt) // only return if it's actually in the DB
+                })
+        })
+        .unwrap_or_default();
+
+    // Pre-process: join continuation lines onto their stat.
+    // Stat lines start with +, -, or x<digit>. Any other non-empty line that follows
+    // a stat line is treated as a wrapped continuation of that stat's name.
+    // Exception: UI text like "FITS IN", "MR N", "INVENTORY" is not a continuation.
+    let mut joined: Vec<String> = Vec::new();
+    {
+        let mut pending: Option<String> = None;
+        for line in parse_text.lines() {
+            let l = line.trim();
+            if l.is_empty() { continue; }
+            let ll = l.to_lowercase();
+            // OCR sometimes misreads '+' as '•', '·', or similar bullet chars
+            let first_char = l.chars().next().unwrap_or(' ');
+            let is_ocr_plus = "•·○●◦".contains(first_char)
+                && l.len() > 1
+                && l.chars().nth(1).map_or(false, |c| c.is_ascii_digit());
+            let is_stat_start = l.starts_with('+') || l.starts_with('-')
+                || (ll.starts_with('x') && l.len() > 2 && l.chars().nth(1).map_or(false, |c| c.is_ascii_digit()))
+                || is_ocr_plus;
+            // "Damage to Grineer/Corpus/Infested" can appear without prefix when OCR drops the
+            // leading "x0.88" multiplier value — treat as standalone stat with unknown value.
+            let is_orphan_stat = ll.starts_with("damage to grineer")
+                || ll.starts_with("damage to corpus")
+                || ll.starts_with("damage to infested");
+            let is_ui_noise = ll.contains("fits in") || ll.starts_with("mr ")
+                || ll.contains("inventory") || ll.contains("cycle")
+                || ll.contains("kuva") || ll.contains("remaining")
+                || ll.contains("show ranked") || ll.contains("cancel");
+            if is_stat_start {
+                if let Some(prev) = pending.take() { joined.push(prev); }
+                pending = Some(l.to_string());
+            } else if is_orphan_stat {
+                // OCR dropped the x-multiplier prefix — synthesise a stat line with unknown value
+                if let Some(prev) = pending.take() { joined.push(prev); }
+                joined.push(format!("+?% {}", l)); // value unknown but stat name preserved
+            } else if is_ui_noise {
+                if let Some(prev) = pending.take() { joined.push(prev); }
+            } else if let Some(ref mut prev) = pending {
+                prev.push(' ');
+                prev.push_str(l);
+            }
+        }
+        if let Some(prev) = pending { joined.push(prev); }
+    }
+
+    // Parse stat lines and collect rolled_stats (name + formatted value for display).
+    let mut positives: Vec<String> = Vec::new();
+    let mut negatives: Vec<String> = Vec::new();
+    // Each entry: { "name": "Combo Count Chance", "value": "+47.2%", "positive": true }
+    let mut rolled_stats: Vec<serde_json::Value> = Vec::new();
+
+    for line in &joined {
+        let l = line.trim();
+
+        // Handle multiplier format "x1.62 Damage to Corpus"
+        // OCR may insert spaces inside the number ("x1 .62"), so collect everything
+        // before the first alphabetic char and join to remove those spaces.
+        if l.to_lowercase().starts_with('x') && l.len() > 2 && l.chars().nth(1).map_or(false, |c| c.is_ascii_digit() || c == ' ') {
+            let alpha_start = l.find(|c: char| c.is_alphabetic() && c != 'x').unwrap_or(l.len());
+            let val_str = l[..alpha_start].split_whitespace().collect::<Vec<_>>().join(""); // e.g. "x1.62"
+            let stat_name = l[alpha_start..].trim();
+            let stat_name = stat_name.split(" (").next().unwrap_or(stat_name).trim();
+            if !stat_name.is_empty() {
+                let full = ocr_stat_to_full_with_condition(stat_name);
+                rolled_stats.push(serde_json::json!({"name": full, "value": val_str, "positive": true}));
+                positives.push(full);
+            }
+            continue;
+        }
+
+        let first_l = l.chars().next().unwrap_or(' ');
+        let (is_pos, stat_part) = if l.starts_with('+') {
+            (true, l.trim_start_matches('+'))
+        } else if l.starts_with('-') {
+            (false, l.trim_start_matches('-'))
+        } else if "•·○●◦".contains(first_l) {
+            // OCR misread '+' as a bullet/dot character — treat as positive stat
+            (true, l.trim_start_matches(|c: char| "•·○●◦".contains(c)))
+        } else { continue; };
+
+        // Extract the numeric value string.
+        // Must explicitly check for '%' first — split('%').next() returns Some(whole_string)
+        // even when no '%' is present, which would produce "+51 'Toxin%" for element stats.
+        let pct_val = if stat_part.starts_with("?%") {
+            // Synthesised from orphan stat — OCR dropped the x-multiplier value
+            "x?".to_string()
+        } else if stat_part.contains('%') {
+            let n = stat_part.split('%').next().unwrap_or("").trim();
+            format!("{}{}%", if is_pos { "+" } else { "-" }, n)
+        } else {
+            // No % sign (element stats, OCR dropped it) — extract leading digits only
+            let num_end = stat_part.find(|c: char| !c.is_ascii_digit() && c != '.').unwrap_or(stat_part.len());
+            format!("{}{}%", if is_pos { "+" } else { "-" }, &stat_part[..num_end])
+        };
+
+        // Extract stat name
+        let stat_name: &str = if let Some(after_pct) = stat_part.splitn(2, '%').nth(1) {
+            after_pct.trim()
+        } else {
+            let num_end = stat_part.find(|c: char| c.is_alphabetic()).unwrap_or(0);
+            stat_part[num_end..].trim_start_matches(|c: char| !c.is_alphabetic())
+        };
+        if stat_name.is_empty() { continue; }
+
+        // Strip leading OCR icon artifacts: "61-leat" → "leat", " 🔥Heat" → "Heat"
+        let stat_name = stat_name.trim_start_matches(|c: char| !c.is_alphabetic());
+        if stat_name.is_empty() { continue; }
+
+        // Strip parenthetical qualifiers: "Critical Chance (x2 for Heavy Attacks)" → "Critical Chance"
+        let stat_name = stat_name.split(" (").next().unwrap_or(stat_name).trim();
+
+        // Try to match with the full conditional name first so "Critical Chance for Slide Attack"
+        // maps to "Slide Critical Chance" (not just "Critical Chance"). Fall back to stripped form.
+        let full = ocr_stat_to_full_with_condition(stat_name);
+        rolled_stats.push(serde_json::json!({"name": full, "value": pct_val, "positive": is_pos}));
+        if is_pos { positives.push(full); } else { negatives.push(full); }
+    }
+
+    let ts3 = chrono::Local::now().format("%H:%M:%S%.3f").to_string();
+    let _ = append_to_file(&riven_log, &format!(
+        "[STEP 3] PARSE RESULT — {}\n\
+         ├─ Weapon    : \"{}\"\n\
+         ├─ Positives : {:?}\n\
+         └─ Negatives : {:?}\n\n",
+        ts3, weapon, positives, negatives
+    ));
+
+    Ok(serde_json::json!({
+        "weapon": weapon,
+        "positives": positives,
+        "negatives": negatives,
+        "rolled_stats": rolled_stats,
+        "is_comparison": is_comparison,
+        "original_rolled_stats": parse_original_stats(original_parse_text),
+        "raw": text,
+    }))
+}
+
+/// Start a lightweight EE.log watcher for features that don't need the memory scanner:
+/// riven reroll detection, trade completion detection, WFM whisper detection.
+/// Called unconditionally at app startup — EE.log is plain file I/O, not memory reading.
+#[tauri::command]
+fn start_log_watcher(app: tauri::AppHandle) -> Result<(), String> {
+    let log_path = dirs::data_local_dir()
+        .map(|d| d.join("Warframe").join("EE.log"))
+        .ok_or("Cannot find LocalAppData")?;
+
+    std::thread::spawn(move || {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file_pos: u64 = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
+        let mut pending_trade: Option<String> = None;
+        // Cooldown: don't fire riven-screen-open again within 4 seconds of the last fire.
+        // Guards against the same EE.log buffer being processed twice by React StrictMode listeners.
+        let mut last_riven_fire: Option<std::time::Instant> = None;
+
+        // Use FindFirstChangeNotificationW so we wake up the instant EE.log is written,
+        // instead of sleeping and polling. This is how Overwolf achieves low latency.
+        let change_handle: isize = {
+            use windows_sys::Win32::Storage::FileSystem::{
+                FindFirstChangeNotificationW, FILE_NOTIFY_CHANGE_LAST_WRITE,
+            };
+            let dir = log_path.parent().unwrap_or(std::path::Path::new("."));
+            let dir_wide: Vec<u16> = dir.to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect();
+            unsafe { FindFirstChangeNotificationW(dir_wide.as_ptr(), 0, FILE_NOTIFY_CHANGE_LAST_WRITE) }
+        };
+        let use_notify = change_handle != -1; // -1 = INVALID_HANDLE_VALUE
+
+        loop {
+            if use_notify {
+                use windows_sys::Win32::System::Threading::WaitForSingleObject;
+                use windows_sys::Win32::Storage::FileSystem::FindNextChangeNotification;
+                // Block until EE.log directory has a write — then process immediately
+                unsafe { WaitForSingleObject(change_handle, 500); } // 500ms safety timeout
+                unsafe { FindNextChangeNotification(change_handle); }
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            let Ok(mut f) = std::fs::File::open(&log_path) else { continue };
+            let len = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
+            if len < file_pos { file_pos = 0; }
+            if len == file_pos { continue; } // nothing new since last read
+            if f.seek(SeekFrom::Start(file_pos)).is_err() { continue; }
+            let mut buf = String::new();
+            if f.read_to_string(&mut buf).is_err() { continue; }
+            file_pos = len;
+            if buf.is_empty() { continue; }
+            let lower = buf.to_lowercase();
+
+            // ── Riven reroll / unveil ─────────────────────────────────────────
+            let riven_trigger =
+                lower.contains("omegarerollselection.swf") ||
+                lower.contains("samodeusdioramaloaded");
+
+            let cooldown_ok = last_riven_fire
+                .map_or(true, |t| t.elapsed().as_secs() >= 4);
+
+            // Auto-trigger disabled — user triggers manually via "Check Riven" button.
+            // Keeping last_riven_fire updated so VolumetricFog close still works.
+            if riven_trigger && cooldown_ok {
+                last_riven_fire = Some(std::time::Instant::now());
+                let _ = app.emit("ff-status", "🎲 Riven screen open — click Check Riven to analyse");
+            }
+
+            // ── Riven screen close ────────────────────────────────────────────
+            // WM_ACTIVATEAPP 0 fires when Warframe loses focus — but it also fires
+            // momentarily when we open the overlay window. Apply a 5-second grace period
+            // after the last trigger so that false-closes from the overlay opening are ignored.
+            // ── Riven screen close — orbiter scene reload ─────────────────────
+            // When the player exits the riven screen, the game reloads the orbiter
+            // scene which creates VolumetricFog render targets. This is far more
+            // reliable than WM_ACTIVATEAPP 0 (which fires on alt-tab too).
+            // Guard: only fire if riven screen was recently active (< 10 min).
+            if lower.contains("creating render target: /ee/materials/volumetricfog") {
+                let riven_active = last_riven_fire.map_or(false, |t| {
+                    let e = t.elapsed().as_secs();
+                    e >= 3 && e < 600 // at least 3s after trigger (not a false-fire on open)
+                });
+                if riven_active {
+                    // Reset so this doesn't fire again for the same session
+                    last_riven_fire = None;
+                    let riven_log = std::env::temp_dir().join("frameforge_riven_session.txt");
+                    let ts = chrono::Local::now().format("%H:%M:%S%.3f").to_string();
+                    let _ = append_to_file(&riven_log, &format!(
+                        "[STEP 4] CLOSE (VolumetricFog render target = orbiter loaded) — {}\n\n", ts
+                    ));
+                    let _ = app.emit("riven-screen-close", ());
+                }
+            }
+
+            // ── WFM trade whisper ─────────────────────────────────────────────
+            if lower.contains("(warframe.market)") {
+                let raw = buf.as_str();
+                let from = raw.find("@From ").map(|i| &raw[i+6..])
+                    .and_then(|s| s.split(" :").next())
+                    .map(|s| s.trim().to_string()).unwrap_or_else(|| "Unknown".to_string());
+                let item = { let p="want to buy "; let s=" for ";
+                    raw.find(p).and_then(|i| { let r=&raw[i+p.len()..]; r.find(s).map(|j| r[..j].to_string()) })
+                };
+                let price: Option<u64> = raw.find(" for ").and_then(|i| {
+                    let r=&raw[i+5..]; r.find(" platinum").and_then(|j| r[..j].trim().parse().ok())
+                });
+                let _ = app.emit("wfm-whisper", serde_json::json!({
+                    "from": from, "message": raw.trim(), "item": item, "price": price,
+                    "timestamp": chrono::Local::now().format("%H:%M:%S").to_string(),
+                }));
+            }
+
+            // ── In-game trade completion ──────────────────────────────────────
+            if lower.contains("dialog::createokcancel") && lower.contains("you are offering") {
+                pending_trade = Some(buf.clone());
+            }
+            if lower.contains("the trade was successful") {
+                if let Some(ref trade_raw) = pending_trade.clone() {
+                    // (same parsing logic as in start_monitor)
+                    let r = trade_raw.as_str();
+                    let with_player = r.find("will receive from ").and_then(|i| {
+                        let a = &r[i+18..]; a.find(" the following").map(|j| a[..j].trim().to_string())
+                    }).unwrap_or_default();
+                    let offered = r.find("You are offering:").and_then(|i| {
+                        let a=&r[i+17..]; a.find("and will receive from").map(|j| a[..j].trim().to_string())
+                    }).unwrap_or_default();
+                    let received = r.find("the following:").and_then(|i| {
+                        let a=&r[i+14..]; a.find(", title=").map(|j| a[..j].trim().to_string())
+                    }).unwrap_or_default();
+                    let parse_plat = |s: &str| -> i64 { s.find("Platinum x ").and_then(|i| s[i+11..].split(|c: char| !c.is_ascii_digit()).next()).and_then(|n| n.parse().ok()).unwrap_or(0) };
+                    let plat_off = parse_plat(&offered);
+                    let plat_rec = parse_plat(&received);
+                    let (direction, item_name, platinum) = if plat_off > 0 {
+                        ("bought", received.lines().find(|l| !l.trim().is_empty() && !l.to_lowercase().contains("platinum")).map(|l| l.trim().to_string()).unwrap_or_default(), plat_off)
+                    } else {
+                        ("sold", offered.lines().find(|l| !l.trim().is_empty() && !l.to_lowercase().contains("platinum")).map(|l| l.trim().to_string()).unwrap_or_default(), plat_rec)
+                    };
+                    let _ = app.emit("trade-completed", serde_json::json!({
+                        "withPlayer": with_player, "direction": direction,
+                        "itemName": item_name, "quantity": 1, "platinum": platinum,
+                        "timestamp": chrono::Utc::now().to_rfc3339(),
+                    }));
+                }
+                pending_trade = None;
+            }
+        }
+    });
+    Ok(())
+}
+
+/// 3-state riven screen status:
+///  "open"    = inventory header visible + "FITS IN" on right panel
+///  "closed"  = inventory header visible + "FITS IN" gone (user exited riven screen)
+///  "unknown" = inventory header not visible (alt-tabbed, or left inventory entirely)
+#[tauri::command]
+fn riven_screen_status() -> String {
+    let riven_log = std::env::temp_dir().join("frameforge_riven_session.txt");
+    let ts = chrono::Local::now().format("%H:%M:%S%.3f").to_string();
+
+    let Ok((pixels, w, h)) = ocr::capture_warframe_pixels() else {
+        let _ = append_to_file(&riven_log, &format!("[POLL {}] capture failed → unknown\n", ts));
+        return "unknown".into();
+    };
+
+    let header = ocr::ocr_pixels_rect_raw(&pixels, w, h, 0.0, 0.55, 0.0, 0.10)
+        .unwrap_or_default();
+    let in_inventory = header.to_lowercase().contains("inventory");
+
+    if !in_inventory {
+        let _ = append_to_file(&riven_log, &format!("[POLL {}] no inventory header → unknown\n", ts));
+        return "unknown".into();
+    }
+
+    let right = ocr::ocr_pixels_rect_raw(&pixels, w, h, 0.73, 1.0, 0.30, 0.80)
+        .unwrap_or_default();
+    let rl = right.to_lowercase();
+    // In comparison mode "FITS IN" may be partially cut off, reading as "SIN", "IN", "TS IN" etc.
+    // Accept any fragment that is a suffix of "FITS IN".
+    let fits_in = rl.contains("fits in") || rl.contains("fits") || rl.contains("ts in")
+        || rl.contains("its in") || (rl.trim() == "in") || (rl.trim() == "sin");
+    let preview = right.lines().filter(|l| !l.trim().is_empty()).collect::<Vec<_>>().join(" | ");
+
+    let status = if fits_in { "open" } else { "closed" };
+    let _ = append_to_file(&riven_log, &format!(
+        "[POLL {}] inventory=true fits_in={} ocr=\"{}\" → {}\n",
+        ts, fits_in, &preview[..preview.len().min(80)], status
+    ));
+    status.into()
+}
+
+/// Is the riven reroll screen still open?
+/// Checks for "FITS IN" text on the right panel using RAW OCR (no preprocessing).
+/// "FITS IN" is white text on dark — readable without grayscale conversion.
+/// Only closes the overlay when Warframe is still focused (INVENTORY/MODS header present)
+/// AND "FITS IN" is gone — so alt-tabbing away doesn't trigger a false close.
+#[tauri::command]
+fn riven_screen_visible() -> bool {
+    let riven_log = std::env::temp_dir().join("frameforge_riven_session.txt");
+    let ts = chrono::Local::now().format("%H:%M:%S%.3f").to_string();
+
+    let Ok((pixels, w, h)) = ocr::capture_warframe_pixels() else {
+        let _ = append_to_file(&riven_log, &format!("[POLL {}] capture failed → true (assume open)\n", ts));
+        return true; // can't capture = can't confirm closed
+    };
+
+    // Check header (x 0–55%, y 0–10%) for "INVENTORY" — confirms Warframe is focused
+    // and we're in the mods screen. If header is absent, user alt-tabbed; keep overlay.
+    let header = ocr::ocr_pixels_rect_raw(&pixels, w, h, 0.0, 0.55, 0.0, 0.10)
+        .unwrap_or_default();
+    let in_inventory = header.to_lowercase().contains("inventory");
+
+    if !in_inventory {
+        let _ = append_to_file(&riven_log, &format!(
+            "[POLL {}] no inventory header → true (alt-tabbed or different screen)\n", ts
+        ));
+        return true; // Warframe not in focus or wrong screen — don't close
+    }
+
+    // Check right panel (x 73–100%, y 30–80%) for "FITS IN"
+    let right = ocr::ocr_pixels_rect_raw(&pixels, w, h, 0.73, 1.0, 0.30, 0.80)
+        .unwrap_or_default();
+    let fits_in_visible = right.to_lowercase().contains("fits");
+    let right_preview = right.lines().filter(|l| !l.trim().is_empty()).collect::<Vec<_>>().join(" | ");
+
+    let _ = append_to_file(&riven_log, &format!(
+        "[POLL {}] inventory=true fits_in={} ocr=\"{}\"\n",
+        ts, fits_in_visible, &right_preview[..right_preview.len().min(120)]
+    ));
+
+    fits_in_visible
+}
+
+/// Write an error into the riven session log (called from TypeScript when OCR command fails).
+#[tauri::command]
+fn ocr_riven_log_error(error: String) {
+    let path = std::env::temp_dir().join("frameforge_riven_session.txt");
+    let ts = chrono::Local::now().format("%H:%M:%S%.3f").to_string();
+    let _ = append_to_file(&path, &format!(
+        "[STEP 2] OCR COMMAND FAILED — {}\n└─ Error: {}\n\n", ts, error
+    ));
+}
+
+/// Return all weapon names that have riven data.
+#[tauri::command]
+fn get_riven_weapons() -> Vec<String> {
+    let db = get_riven_db().lock().unwrap_or_else(|e| e.into_inner());
+    let mut weapons: Vec<String> = db.keys().cloned().collect();
+    weapons.sort();
+    weapons
+}
+
+/// Reload the riven database from the Google Sheet.
+#[tauri::command]
+fn reload_riven_database() -> Result<usize, String> {
+    let fresh = load_riven_csv_from_url()?;
+    let count = fresh.len();
+    *get_riven_db().lock().unwrap_or_else(|e| e.into_inner()) = fresh;
+    Ok(count)
+}
+
+/// Analyse a riven roll for a given weapon.
+/// positives / negatives are full stat names (e.g. "Critical Damage", "Zoom").
+#[tauri::command]
+fn analyze_riven(weapon: String, positives: Vec<String>, negatives: Vec<String>) -> Option<RivenAnalysis> {
+    let db = get_riven_db().lock().unwrap_or_else(|e| e.into_inner());
+    let key = weapon.to_lowercase();
+    let entry = db.get(&key)?;
+
+    let normalize = |s: &str| s.to_lowercase();
+
+    // Score per group: space-separated = each is its own slot; slash-separated = any one fills a slot.
+    // "CD MS/TOX/DMG" has 2 groups. Rolling CD+MS = 2/2 = 100%, not 2/7.
+    let mut matched: Vec<String> = Vec::new();
+    let mut missing: Vec<String> = Vec::new(); // one formatted string per unmatched group
+
+    for group in &entry.stat_groups {
+        let hit = positives.iter().find(|p| group.iter().any(|g| normalize(g) == normalize(p)));
+        if let Some(stat) = hit {
+            matched.push(stat.clone());
+        } else {
+            // Format: "Critical Damage" for single, "Multishot / Toxicity / Fire Rate" for group
+            missing.push(group.join(" / "));
+        }
+    }
+
+    let mut safe_present: Vec<String> = Vec::new();
+    let mut harmful: Vec<String> = Vec::new();
+    for neg in &negatives {
+        if entry.safe_negatives.iter().any(|s| normalize(s) == normalize(neg)) {
+            safe_present.push(neg.clone());
+        } else {
+            harmful.push(neg.clone());
+        }
+    }
+
+    let total = entry.stat_groups.len().max(1);
+    let score = matched.len() as f32 / total as f32;
+    let neg_ok = harmful.is_empty();
+
+    let verdict = match (score, neg_ok) {
+        (s, true)  if s >= 0.80 => "GREAT ROLL — Consider keeping".to_string(),
+        (s, true)  if s >= 0.60 => "GOOD ROLL — Decent for selling".to_string(),
+        (s, _)     if s >= 0.40 => "MEDIOCRE — Keep rolling".to_string(),
+        _                        => "BAD ROLL — Keep rolling".to_string(),
+    };
+
+    Some(RivenAnalysis {
+        weapon: entry.weapon.clone(),
+        matched_positives: matched,
+        missing_positives: missing,
+        safe_negatives_present: safe_present,
+        harmful_negatives: harmful,
+        total_wanted: total,
+        score,
+        verdict,
+        notes: entry.notes.clone(),
+    })
+}
+
 /// Debug: return the raw JSON from any authenticated WFM endpoint.
 #[tauri::command]
 fn wfm_debug_dump(state: State<AppState>, path: String) -> Result<String, String> {
@@ -1867,6 +2841,14 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                         "price": price,
                         "timestamp": chrono::Local::now().format("%H:%M:%S").to_string(),
                     }));
+                }
+
+                // Riven trigger and close events are handled exclusively by start_log_watcher
+                // (always-on) — do not duplicate them here.
+
+                // Unveil: riven challenge completion
+                if lower.contains("modreveal") || (lower.contains("riven") && lower.contains("unveiled")) {
+                    let _ = ee_ocr_app.emit("riven-unveiled", ());
                 }
 
                 // ── In-game trade detection ──────────────────────────────────────
@@ -3159,6 +4141,14 @@ async fn fetch_worldstate(state: State<'_, AppState>) -> Result<serde_json::Valu
     .map_err(|e| format!("task error: {}", e))?
 }
 
+/// Read the riven overlay session log.
+#[tauri::command]
+fn get_riven_session_log() -> String {
+    let path = std::env::temp_dir().join("frameforge_riven_session.txt");
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|_| "(no riven session log yet — open the riven reroll screen first)".into())
+}
+
 /// Read the current overlay session log.
 #[tauri::command]
 fn get_overlay_session_log() -> String {
@@ -3419,6 +4409,15 @@ pub fn run() {
             fetch_wfm_price,
             get_item_price,
             wfm_set_status,
+            start_log_watcher,
+            ocr_riven_log_error,
+            riven_screen_visible,
+            riven_screen_status,
+            get_riven_weapons,
+            reload_riven_database,
+            analyze_riven,
+            ocr_riven_screen,
+            get_riven_session_log,
             wfm_debug_dump,
             wfm_get_item_orders,
             wfm_get_item_statistics,

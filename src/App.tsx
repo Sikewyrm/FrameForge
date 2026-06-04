@@ -3,10 +3,61 @@ import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
+
+// ── Riven overlay — module-level window management ────────────────────────────
+// Stored OUTSIDE React so StrictMode remounts don't destroy/recreate the window.
+let _rivenWin: WebviewWindow | null = null;
+let _rivenRollCount = 0;
+// _rivenLastTriggerMs removed — re-add when auto-detection is re-enabled
+// Exposed so the "Check Riven" button can trigger from anywhere without the 4s cooldown
+let _rivenManualTrigger: (() => void) | null = null;
+export function checkRivenNow() { _rivenManualTrigger?.(); }
+
+function rivenWinHide(reason = "rivenWinHide") {
+  const win = _rivenWin;
+  if (!win) { return; }
+  invoke("ocr_riven_log_error", { error: `[HIDE] ${reason}` }).catch(() => {});
+  _rivenWin = null;
+  win.close().catch(() => {});
+}
+
+async function ensureRivenWindow(wx: number, wy: number, wh: number): Promise<{ win: WebviewWindow; fresh: boolean } | null> {
+  // 1. Existing valid handle
+  if (_rivenWin) return { win: _rivenWin, fresh: false };
+
+  // 2. Window exists but JS lost reference (HMR, page reload)
+  const existing = await WebviewWindow.getByLabel("riven-overlay").catch(() => null);
+  if (existing) {
+    _rivenWin = existing;
+    _rivenWin.once("tauri://destroyed", () => { _rivenWin = null; });
+    return { win: _rivenWin, fresh: false };
+  }
+
+  // 3. Create fresh at correct position — shows immediately
+  try {
+    _rivenWin = new WebviewWindow("riven-overlay", {
+      url: `index.html?rivenoverlay`,
+      title: "FrameForge Riven",
+      transparent: true, decorations: false,
+      alwaysOnTop: true, skipTaskbar: true,
+      resizable: false, focus: false,
+      x: wx + 10, y: wy + Math.round(wh * 0.20),
+      width: 300, height: Math.round(wh * 0.60),
+    });
+    _rivenWin.once("tauri://destroyed", () => { _rivenWin = null; });
+    return { win: _rivenWin, fresh: true };
+  } catch {
+    _rivenWin = null;
+    return null;
+  }
+}
 import { getCurrentWindow } from "@tauri-apps/api/window";
+
 import Foundry from "./Foundry";
 import MarketHelper from "./MarketHelper";
 import RelicHelper from "./RelicHelper";
+import RivenAnalyzer from "./RivenAnalyzer";
+import RivenOverlayWindow from "./RivenOverlayWindow";
 import TimerHelper, { FissureWatch } from "./TimerHelper";
 import Statistics from "./Statistics";
 import Overlay from "./Overlay";
@@ -16,9 +67,9 @@ import "./App.css";
 
 const _params = new URLSearchParams(window.location.search);
 // If the URL contains ?overlay, render the overlay instead of the main app
-const IS_OVERLAY = _params.has("overlay");
-// If the URL contains ?modular, render the standalone modular window
-const IS_MODULAR = _params.has("modular");
+const IS_OVERLAY       = _params.has("overlay");
+const IS_MODULAR       = _params.has("modular");
+const IS_RIVEN_OVERLAY = _params.has("rivenoverlay");
 
 class ErrorBoundary extends Component<{ children: ReactNode }, { err: string | null }> {
   constructor(props: any) { super(props); this.state = { err: null }; }
@@ -75,7 +126,7 @@ interface InventoryUpdate {
   scanned_at: number;
 }
 
-type Module = "inventory" | "foundry" | "market" | "relics" | "timers" | "statistics";
+type Module = "inventory" | "foundry" | "market" | "relics" | "rivens" | "timers" | "statistics";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -268,9 +319,12 @@ function ModularWindowPage() {
 
 // ─── App ──────────────────────────────────────────────────────────────────────
 
+// RelicAndRivenTab is kept but now just shows RelicHelper — Rivens moved to own tab
+
 export default function App() {
   // If we're the overlay window, render only the overlay UI
   if (IS_OVERLAY) return <Overlay />;
+  if (IS_RIVEN_OVERLAY) return <RivenOverlayWindow />;
   // If we're the pop-out modular window, render the standalone modular UI
   if (IS_MODULAR) return <ModularWindowPage />;
 
@@ -368,6 +422,13 @@ export default function App() {
       invoke("stop_monitor").then(() => setMonitoring(false)).catch(() => {});
     }
   }, [memoryScannerEnabled]); // eslint-disable-line
+
+  // ── Log watcher — always start regardless of memory scanner toggle ─────────
+  // EE.log is plain file I/O (not memory reading) — handles riven detection,
+  // trade completion, and WFM whisper detection unconditionally.
+  useEffect(() => {
+    invoke("start_log_watcher").catch(() => {});
+  }, []); // eslint-disable-line
 
   // ── WFM auto-login at app start ───────────────────────────────────────────
   // Restores the session into Rust's AppState so the Trading tab is instantly
@@ -792,9 +853,11 @@ export default function App() {
       localStorage.setItem("ff-api-mod-copies", JSON.stringify(apiModCopies));
   }, [apiModCopies]);
 
-  useEffect(() => { if (settingsLoadedRef.current) saveAllSettings(); }, [tracked]);   // eslint-disable-line
-  useEffect(() => { if (settingsLoadedRef.current) saveAllSettings(); }, [favorites]); // eslint-disable-line
-  useEffect(() => { if (settingsLoadedRef.current) saveAllSettings(); }, [modularWidth]); // eslint-disable-line
+  useEffect(() => { if (settingsLoadedRef.current) saveAllSettings(); }, [tracked]);              // eslint-disable-line
+  useEffect(() => { if (settingsLoadedRef.current) saveAllSettings(); }, [favorites]);             // eslint-disable-line
+  useEffect(() => { if (settingsLoadedRef.current) saveAllSettings(); }, [modularWidth]);          // eslint-disable-line
+  useEffect(() => { if (settingsLoadedRef.current) saveAllSettings(); }, [memoryScannerEnabled]);  // eslint-disable-line
+  useEffect(() => { if (settingsLoadedRef.current) saveAllSettings(); }, [companionApiEnabled]);   // eslint-disable-line
   useEffect(() => { if (settingsLoadedRef.current) saveAllSettings(); }, [modularSectionOrder]); // eslint-disable-line
   useEffect(() => { if (settingsLoadedRef.current) saveAllSettings(); }, [modularPopout]); // eslint-disable-line
 
@@ -878,6 +941,100 @@ export default function App() {
     doFetch();
     return () => { cancelled = true; clearTimeout(timeoutId); };
   }, [applyInventoryData, companionApiEnabled]); // eslint-disable-line
+
+  // ── Riven overlay ─────────────────────────────────────────────────────────
+  // Window state lives in module-level _rivenWin (above) — unaffected by StrictMode.
+  // No pre-creation: show() silently fails on visible:false windows with this config.
+  // Fresh window created on trigger (shows correctly); existing visible window reused for cycling.
+  useEffect(() => {
+    // Core OCR + overlay display. Called manually via button or (future) auto-detection.
+    const runRivenCheck = async () => {
+      void 0; // _rivenLastTriggerMs = Date.now() — for auto-detection cooldown when re-enabled
+      _rivenRollCount++;
+      const { emit } = await import("@tauri-apps/api/event");
+
+      let rect: [number, number, number, number] = [0, 0, 0, 800];
+      try { rect = await invoke<[number, number, number, number]>("get_warframe_window_rect"); } catch {}
+      const [wx, wy, , wh] = rect;
+      const result = await ensureRivenWindow(wx, wy, wh);
+      let pendingPayload: object | null = null;
+      let windowReady = false;
+
+      if (result && !result.fresh) {
+        // Existing window — reset overlay state
+        await emit("riven-scanning-start", {}).catch(() => {});
+        windowReady = true;
+      } else if (result?.fresh) {
+        // Fresh window — send data when it's ready
+        result.win.once("tauri://created", async () => {
+          windowReady = true;
+          if (pendingPayload) { await emit("riven-analysis-update", pendingPayload).catch(() => {}); pendingPayload = null; }
+        });
+      }
+
+      try {
+        const ocrResult = await invoke<{ weapon: string; positives: string[]; negatives: string[]; rolled_stats: {name:string;value:string;positive:boolean}[]; is_comparison: boolean; original_rolled_stats: {name:string;value:string;positive:boolean}[]; raw: string }>("ocr_riven_screen");
+        const analysis = (ocrResult.weapon || ocrResult.positives.length > 0)
+          ? await invoke("analyze_riven", { weapon: ocrResult.weapon, positives: ocrResult.positives, negatives: ocrResult.negatives }).catch(() => null)
+          : null;
+        const payload = { analysis, ocrRaw: ocrResult.raw, weapon: ocrResult.weapon, positives: ocrResult.positives, negatives: ocrResult.negatives, rolledStats: ocrResult.rolled_stats, isComparison: ocrResult.is_comparison, originalStats: ocrResult.original_rolled_stats, rollCount: _rivenRollCount };
+        if (windowReady) { await emit("riven-analysis-update", payload).catch(() => {}); }
+        else              { pendingPayload = payload; }
+      } catch (e) {
+        await invoke("ocr_riven_log_error", { error: String(e) }).catch(() => {});
+        const payload = { analysis: null, ocrRaw: `OCR ERROR: ${e}`, weapon: "", positives: [], negatives: [], rolledStats: [], isComparison: false, originalStats: [], rollCount: _rivenRollCount };
+        if (windowReady) { await emit("riven-analysis-update", payload).catch(() => {}); }
+        else              { pendingPayload = payload; }
+      }
+    };
+
+    // Wire module-level trigger so "Check Riven" button and "Start Comparison" can call it
+    _rivenManualTrigger = () => { runRivenCheck().catch(() => {}); };
+
+    // overlay "Start Comparison" button emits this event
+    const unsubManual = listen("riven-manual-check", () => runRivenCheck().catch(() => {}));
+
+    // Auto-detection (disabled) — kept here to re-enable later
+    const unsubAutoDetect = listen("riven-screen-open", async () => {
+      // TODO: re-enable when auto-detection is reliable
+      // const now = Date.now();
+      // if (now - _rivenLastTriggerMs < 4000) return;
+      // runRivenCheck();
+    });
+
+    const unsubClose   = listen("riven-screen-close",  () => rivenWinHide("screen-close"));
+    const unsubHideReq = listen<{ reason?: string }>("riven-overlay-hide", e => rivenWinHide(e.payload?.reason ?? "overlay-hide"));
+
+    let pollMissCount = 0;
+    let unknownCount = 0;
+    let pollActive = false;
+    const pollInterval = setInterval(async () => {
+      if (!_rivenWin || pollActive) return;
+      pollActive = true;
+      try {
+        const timeout = new Promise<string>(r => setTimeout(() => r("unknown"), 3000));
+        const status  = await Promise.race([invoke<string>("riven_screen_status").catch(() => "unknown"), timeout]);
+        if (status === "open") {
+          pollMissCount = 0; unknownCount = 0;
+        } else if (status === "closed") {
+          pollMissCount++; unknownCount = 0;
+          if (pollMissCount >= 10) { pollMissCount = 0; rivenWinHide("poll-10-closed-misses"); }
+        } else {
+          pollMissCount = 0; unknownCount++;
+          if (unknownCount >= 20) { unknownCount = 0; rivenWinHide("poll-unknown-40s"); }
+        }
+      } finally { pollActive = false; }
+    }, 2000);
+
+    return () => {
+      unsubManual.then(fn => fn());
+      unsubAutoDetect.then(fn => fn());
+      unsubClose.then(fn => fn());
+      unsubHideReq.then(fn => fn());
+      clearInterval(pollInterval);
+      _rivenManualTrigger = null;
+    };
+  }, []); // eslint-disable-line
 
   // ── Relic reward overlay ──────────────────────────────────────────────────
   useEffect(() => {
@@ -1320,7 +1477,7 @@ export default function App() {
                   <button
                     className="btn-secondary"
                     style={{ minWidth: 64, background: memoryScannerEnabled ? "rgba(240,192,64,.15)" : undefined, borderColor: memoryScannerEnabled ? "#f0c040" : undefined, color: memoryScannerEnabled ? "#f0c040" : undefined }}
-                    onClick={() => { const next = !memoryScannerEnabled; setMemoryScannerEnabled(next); saveAllSettings(); }}
+                    onClick={() => setMemoryScannerEnabled(v => !v)}
                   >
                     {memoryScannerEnabled ? "Enabled" : "Disabled"}
                   </button>
@@ -1351,7 +1508,7 @@ export default function App() {
                   <button
                     className="btn-secondary"
                     style={{ minWidth: 64, background: companionApiEnabled ? "rgba(240,192,64,.15)" : undefined, borderColor: companionApiEnabled ? "#f0c040" : undefined, color: companionApiEnabled ? "#f0c040" : undefined }}
-                    onClick={() => { const next = !companionApiEnabled; setCompanionApiEnabled(next); saveAllSettings(); }}
+                    onClick={() => setCompanionApiEnabled(v => !v)}
                   >
                     {companionApiEnabled ? "Enabled" : "Disabled"}
                   </button>
@@ -1574,6 +1731,14 @@ export default function App() {
             <img src="/statistics-icon.png" alt="" style={{ width: 24, height: 24, objectFit: "contain" }} />
             <span className="module-label">Statistics</span>
           </button>
+          <button
+            className={`module-btn ${activeModule === "rivens" ? "module-active" : ""}`}
+            onClick={() => setActiveModule("rivens")}
+            title="Riven Analyzer"
+          >
+            <img src="/riven-icon.png" alt="" style={{ width: 24, height: 24, objectFit: "contain" }} />
+            <span className="module-label">Rivens</span>
+          </button>
         </nav>
 
         {/* ── Inventory module ── */}
@@ -1780,10 +1945,19 @@ export default function App() {
           <MarketHelper quantities={mergedQty} apiQuantities={apiQuantities} refreshKey={itemsRefreshKey} crafting={crafting} />
         )}
 
-        {/* ── Relic Helper module ── */}
+        {/* ── Relics module ── */}
         {activeModule === "relics" && (
           <ErrorBoundary>
             <RelicHelper quantities={mergedQty} apiQuantities={apiQuantities} masteryData={masteryData} refreshKey={itemsRefreshKey} colorblindMode={colorblindMode} />
+          </ErrorBoundary>
+        )}
+
+        {/* ── Rivens module ── */}
+        {activeModule === "rivens" && (
+          <ErrorBoundary>
+            <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden", minHeight: 0 }}>
+              <RivenAnalyzer />
+            </div>
           </ErrorBoundary>
         )}
 

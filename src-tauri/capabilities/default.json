@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Capability for the main window and overlay",
-  "windows": ["main", "relic-overlay", "modular-popout", "wfm-login"],
+  "windows": ["main", "relic-overlay", "modular-popout", "wfm-login", "riven-overlay"],
   "permissions": [
     "core:default",
     "opener:default",

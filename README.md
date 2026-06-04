@@ -1,6 +1,6 @@
-# FrameForge — Warframe Companion `v1.4.2`
+# FrameForge — Warframe Companion `v1.5.0`
 
-A desktop companion for Warframe that shows your live inventory, tracks crafting recipes, displays market prices, runs a full trading desk, manages a live timer dashboard, and auto-detects relic reward screens — all without modifying the game.
+A desktop companion for Warframe that shows your live inventory, tracks crafting recipes, displays market prices, runs a full trading desk, manages a live timer dashboard, auto-detects relic reward screens, and analyses riven mods — all without modifying the game.
 
 > **Windows only** — requires Windows 10 or 11. Inventory scanning requires Warframe to be running; all other features work standalone.
 
@@ -78,6 +78,17 @@ A full trade history and analytics dashboard, automatically populated from your 
 - **Daily bar chart** — green bars on days you earned, red bars on days you spent
 - **Items breakdown table** — every item with # sold, # bought, average sell price, and net platinum; sorted by most profitable
 - **Top trading partners** — top 10 players by total platinum exchanged
+
+### Riven Analyzer
+A dedicated tab for analysing riven mod rolls against the community-curated Sikewyrm spreadsheet (413+ weapons across all categories):
+
+- **Check Riven** — click the button while the riven screen is open in Warframe. FrameForge captures the card with Windows OCR and shows an instant analysis overlay.
+- **Per-stat quality rating** — each rolled stat is colour-coded: ✓ green = wanted, ○ yellow = not in wanted list, ✗ red = harmful negative, ✓ blue = safe negative.
+- **Comparison mode** — click **Refresh** after cycling to see the new roll side-by-side with the original. Both rolls are quality-rated so you can decide whether to keep or keep rolling.
+- **Group-based scoring** — slash-separated alternatives (e.g. `CD MS/TOX/DMG`) are counted as a single slot. A roll of CD+MS on a weapon that wants `CD MS/TOX/DMG` scores 100 %, not 28 %.
+- **Wanted stat list** — missing wanted groups shown compactly at the bottom (e.g. "Wanted: Multishot, Base Damage / Fire Rate / Toxicity").
+- **Database notes** — build context from the spreadsheet shown inline (e.g. minimum CC thresholds for Eidolon builds).
+- **All weapon types** — primary, secondary, melee, archwing weapons. Database refreshes via the ↻ button.
 
 ### OCR Relic Reward Overlay
 When a void fissure reward screen opens in-game, FrameForge automatically captures and reads all four reward cards using Windows OCR and displays a transparent overlay with each item's platinum price, ducat value, and set completion — so you can pick the best reward instantly without alt-tabbing. Priority mode is configurable: Item Completion, Most Set Value, Most Plat, or Most Ducats.

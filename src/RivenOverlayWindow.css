@@ -1,0 +1,234 @@
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body { background: transparent; overflow: hidden; }
+
+.rov-root {
+  width: 100vw;
+  height: 100vh;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 8px;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+.rov-card {
+  background: rgba(13, 17, 23, 0.93);
+  border: 1px solid rgba(56, 139, 253, 0.3);
+  border-radius: 10px;
+  padding: 12px 14px;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  backdrop-filter: blur(10px);
+  box-shadow: 0 8px 32px rgba(0,0,0,.65);
+}
+
+/* ── Header ── */
+.rov-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.rov-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: #e6edf3;
+  flex: 1;
+}
+
+.rov-roll {
+  font-size: 11px;
+  font-weight: 600;
+  background: rgba(56,139,253,.18);
+  color: #58a6ff;
+  border-radius: 4px;
+  padding: 2px 7px;
+}
+
+.rov-compare-btn {
+  background: rgba(56,139,253,.15);
+  border: 1px solid rgba(56,139,253,.35);
+  color: #58a6ff;
+  font-size: 10px;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 2px 7px;
+  border-radius: 4px;
+  line-height: 1.4;
+  transition: background .15s;
+}
+.rov-compare-btn:hover { background: rgba(56,139,253,.28); }
+
+.rov-close-btn {
+  background: none;
+  border: none;
+  color: rgba(139,148,158,.5);
+  font-size: 12px;
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 4px;
+  line-height: 1;
+  transition: color 0.15s, background 0.15s;
+}
+.rov-close-btn:hover { color: #f85149; background: rgba(248,81,73,.12); }
+
+/* ── Scanning / empty ── */
+.rov-scanning {
+  font-size: 12px;
+  color: rgba(139,148,158,.8);
+  text-align: center;
+  padding: 6px 0;
+}
+
+/* ── Verdict ── */
+.rov-verdict {
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: .3px;
+}
+
+/* ── Score bar ── */
+.rov-score-wrap {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.rov-score-track {
+  flex: 1;
+  height: 5px;
+  background: rgba(255,255,255,.08);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.rov-score-fill {
+  height: 100%;
+  border-radius: 3px;
+  transition: width .4s ease;
+}
+.rov-score-pct {
+  font-size: 11px;
+  font-weight: 600;
+  min-width: 30px;
+  text-align: right;
+}
+
+/* ── Rolled stats ── */
+.rov-rolled-stats {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border-top: 1px solid rgba(255,255,255,.06);
+  padding-top: 8px;
+}
+
+.rov-stat-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+  padding: 3px 6px;
+  border-radius: 5px;
+}
+
+.rov-stat-icon {
+  font-size: 11px;
+  width: 13px;
+  text-align: center;
+  flex-shrink: 0;
+}
+
+.rov-stat-name {
+  flex: 1;
+  color: #e6edf3;
+}
+
+.rov-stat-value {
+  font-size: 12px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+
+/* Wanted stat (rolled and it's good) */
+.rov-stat-wanted {
+  background: rgba(63,185,80,.1);
+}
+.rov-stat-wanted .rov-stat-icon { color: #3fb950; }
+.rov-stat-wanted .rov-stat-value { color: #3fb950; }
+
+/* Neutral (rolled but not in wanted list) */
+.rov-stat-neutral {
+  background: rgba(255,255,255,.04);
+}
+.rov-stat-neutral .rov-stat-icon { color: rgba(139,148,158,.6); }
+.rov-stat-neutral .rov-stat-name { color: rgba(230,237,243,.7); }
+.rov-stat-neutral .rov-stat-value { color: #f0c040; }
+
+/* Safe negative */
+.rov-stat-safeneg {
+  background: rgba(56,139,253,.08);
+}
+.rov-stat-safeneg .rov-stat-icon { color: #58a6ff; }
+.rov-stat-safeneg .rov-stat-value { color: #58a6ff; }
+
+/* Harmful negative */
+.rov-stat-harmful {
+  background: rgba(248,81,73,.08);
+}
+.rov-stat-harmful .rov-stat-icon { color: #f85149; }
+.rov-stat-harmful .rov-stat-value { color: #f85149; }
+
+/* ── Original roll section (comparison mode) ── */
+.rov-original-section {
+  border-top: 1px solid rgba(255,255,255,.06);
+  padding-top: 6px;
+}
+.rov-section-label {
+  font-size: 10px;
+  font-weight: 600;
+  color: rgba(139,148,158,.55);
+  text-transform: uppercase;
+  letter-spacing: .5px;
+  margin-bottom: 4px;
+}
+.rov-stat-original {
+  background: rgba(255,255,255,.02);
+  opacity: 0.75;
+}
+.rov-stat-original .rov-stat-icon { color: rgba(139,148,158,.4); }
+.rov-stat-original .rov-stat-name { color: rgba(230,237,243,.55); }
+
+/* Also label the new roll section when in comparison mode */
+.rov-new-roll-label {
+  font-size: 10px;
+  font-weight: 600;
+  color: rgba(139,148,158,.55);
+  text-transform: uppercase;
+  letter-spacing: .5px;
+  margin-bottom: 4px;
+}
+
+/* ── Missing wanted stats ── */
+.rov-missing {
+  font-size: 10.5px;
+  color: rgba(139,148,158,.65);
+  border-top: 1px solid rgba(255,255,255,.06);
+  padding-top: 6px;
+  line-height: 1.6;
+  overflow-wrap: break-word;
+  word-wrap: break-word;
+}
+.rov-missing-label { font-weight: 600; }
+.rov-missing-stat { color: rgba(139,148,158,.9); }
+
+/* ── Notes ── */
+.rov-notes {
+  font-size: 10px;
+  color: rgba(139,148,158,.7);
+  font-style: italic;
+  border-top: 1px solid rgba(255,255,255,.06);
+  padding-top: 5px;
+}

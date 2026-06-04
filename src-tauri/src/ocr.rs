@@ -130,6 +130,156 @@ fn capture_printwindow() -> Option<(Vec<u8>, u32, u32, u32)> {
     }
 }
 
+/// Capture a vertical slice of the Warframe window and run OCR on it.
+/// y_start / y_end are fractions of the full window height (0.0–1.0).
+/// Returns the raw OCR text.
+/// Capture the Warframe window using PrintWindow and return raw BGRA pixels + dimensions.
+/// Single capture can be reused for multiple OCR regions via `ocr_pixels_rect`.
+#[cfg(target_os = "windows")]
+pub fn capture_warframe_pixels() -> Result<(Vec<u8>, u32, u32), String> {
+    use std::mem;
+    use windows_sys::Win32::{
+        Foundation::RECT,
+        Graphics::Gdi::{
+            CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject,
+            GetDIBits, GetDC, ReleaseDC, SelectObject,
+            BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, RGBQUAD,
+        },
+        UI::WindowsAndMessaging::{FindWindowW, GetClientRect},
+    };
+    #[link(name = "user32")]
+    extern "system" { fn PrintWindow(hwnd: isize, hdcblt: isize, nflags: u32) -> i32; }
+    const PW_RENDERFULLCONTENT: u32 = 2;
+
+    unsafe {
+        let title: Vec<u16> = "Warframe\0".encode_utf16().collect();
+        let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+        if hwnd == 0 { return Err("Warframe window not found".into()); }
+
+        let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        GetClientRect(hwnd, &mut rect);
+        let full_w = (rect.right  - rect.left) as u32;
+        let full_h = (rect.bottom - rect.top)  as u32;
+        if full_w < 100 || full_h < 100 { return Err("Window too small".into()); }
+
+        let hdc_win = GetDC(hwnd);
+        let hdc_mem = CreateCompatibleDC(hdc_win);
+        let hbm     = CreateCompatibleBitmap(hdc_win, full_w as i32, full_h as i32);
+        let hbm_old = SelectObject(hdc_mem, hbm);
+        PrintWindow(hwnd, hdc_mem, PW_RENDERFULLCONTENT);
+
+        let mut bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: full_w as i32,
+                biHeight: -(full_h as i32),
+                biPlanes: 1, biBitCount: 32, biCompression: BI_RGB,
+                biSizeImage: 0, biXPelsPerMeter: 0, biYPelsPerMeter: 0,
+                biClrUsed: 0, biClrImportant: 0,
+            },
+            bmiColors: [RGBQUAD { rgbBlue: 0, rgbGreen: 0, rgbRed: 0, rgbReserved: 0 }],
+        };
+        let mut pixels = vec![0u8; (full_w * full_h * 4) as usize];
+        GetDIBits(hdc_mem, hbm, 0, full_h,
+                  pixels.as_mut_ptr() as *mut _, &mut bmi, DIB_RGB_COLORS);
+        SelectObject(hdc_mem, hbm_old);
+        DeleteObject(hbm);
+        DeleteDC(hdc_mem);
+        ReleaseDC(hwnd, hdc_win);
+        Ok((pixels, full_w, full_h))
+    }
+}
+
+/// 2× nearest-neighbour upscale + contrast stretch on BGRA pixels.
+/// WinRT OCR accuracy improves significantly on larger, high-contrast images.
+/// Grayscale + contrast stretch on BGRA pixels.
+/// Converting to grayscale is the key step: element icons (❄ Cold, 🔥 Heat, ☠ Toxin)
+/// are colored glyphs — in the original BGRA image WinRT OCR rejects these lines as
+/// graphics. After grayscale they become neutral-brightness shapes, so OCR reads the
+/// white text on either side of the icon instead of dropping the whole line.
+fn preprocess_for_ocr(pixels: &[u8], width: u32, height: u32) -> (Vec<u8>, u32, u32) {
+    let mut out = pixels.to_vec();
+    for px in out.chunks_mut(4) {
+        // Standard luminance: 0.299 R + 0.587 G + 0.114 B (BGRA order)
+        let gray = ((px[2] as u32 * 299 + px[1] as u32 * 587 + px[0] as u32 * 114) / 1000)
+            .min(255) as u8;
+        // Mild contrast stretch [20, 235] → [0, 255]
+        let v = ((gray as i32 - 20) * 255 / 215).clamp(0, 255) as u8;
+        px[0] = v;
+        px[1] = v;
+        px[2] = v;
+    }
+    (out, width, height)
+}
+
+/// OCR a rectangle from a pre-captured pixel buffer. All coordinates are 0.0–1.0 fractions.
+/// Applies a mild contrast stretch before OCR (no upscaling — upscaling distorts numerals).
+#[cfg(target_os = "windows")]
+pub fn ocr_pixels_rect(
+    pixels: &[u8], full_w: u32, full_h: u32,
+    x_start: f32, x_end: f32, y_start: f32, y_end: f32,
+) -> Result<String, String> {
+    let col_s = (full_w as f32 * x_start.clamp(0.0, 1.0)) as usize;
+    let col_e = ((full_w as f32 * x_end.clamp(0.0, 1.0)) as usize).min(full_w as usize);
+    let row_s = (full_h as f32 * y_start.clamp(0.0, 1.0)) as usize;
+    let row_e = ((full_h as f32 * y_end.clamp(0.0, 1.0)) as usize).min(full_h as usize);
+    let rect_w = (col_e - col_s) as u32;
+    let rect_h = (row_e - row_s) as u32;
+    if rect_w < 4 || rect_h < 4 { return Err("Region too small".into()); }
+
+    let src_stride  = full_w as usize * 4;
+    let dst_stride  = rect_w as usize * 4;
+    let mut cropped = vec![0u8; dst_stride * rect_h as usize];
+    for row in 0..rect_h as usize {
+        let src = (row_s + row) * src_stride + col_s * 4;
+        let dst = row * dst_stride;
+        cropped[dst..dst + dst_stride].copy_from_slice(&pixels[src..src + dst_stride]);
+    }
+
+    let (enhanced, ew, eh) = preprocess_for_ocr(&cropped, rect_w, rect_h);
+    let bmp = to_bmp(&enhanced, ew, eh);
+    run_windows_ocr(bmp, ew).map(|(text, _)| text)
+}
+
+/// OCR a rectangle WITHOUT preprocessing — for white-on-dark text that OCRs fine raw.
+#[cfg(target_os = "windows")]
+pub fn ocr_pixels_rect_raw(
+    pixels: &[u8], full_w: u32, full_h: u32,
+    x_start: f32, x_end: f32, y_start: f32, y_end: f32,
+) -> Result<String, String> {
+    let col_s = (full_w as f32 * x_start.clamp(0.0, 1.0)) as usize;
+    let col_e = ((full_w as f32 * x_end.clamp(0.0, 1.0)) as usize).min(full_w as usize);
+    let row_s = (full_h as f32 * y_start.clamp(0.0, 1.0)) as usize;
+    let row_e = ((full_h as f32 * y_end.clamp(0.0, 1.0)) as usize).min(full_h as usize);
+    let rect_w = (col_e - col_s) as u32;
+    let rect_h = (row_e - row_s) as u32;
+    if rect_w < 4 || rect_h < 4 { return Err("Region too small".into()); }
+    let src_stride = full_w as usize * 4;
+    let dst_stride = rect_w as usize * 4;
+    let mut cropped = vec![0u8; dst_stride * rect_h as usize];
+    for row in 0..rect_h as usize {
+        let src = (row_s + row) * src_stride + col_s * 4;
+        let dst = row * dst_stride;
+        cropped[dst..dst + dst_stride].copy_from_slice(&pixels[src..src + dst_stride]);
+    }
+    let bmp = to_bmp(&cropped, rect_w, rect_h);
+    run_windows_ocr(bmp, rect_w).map(|(text, _)| text)
+}
+
+/// Convenience: capture + OCR a vertical strip of the window (full width).
+#[allow(dead_code)]
+pub fn capture_and_ocr_region(y_start: f32, y_end: f32) -> Result<String, String> {
+    let (pixels, w, h) = capture_warframe_pixels()?;
+    ocr_pixels_rect(&pixels, w, h, 0.0, 1.0, y_start, y_end)
+}
+
+/// Convenience: capture + OCR a specific rectangle.
+#[allow(dead_code)]
+pub fn capture_rect_and_ocr(x_start: f32, x_end: f32, y_start: f32, y_end: f32) -> Result<String, String> {
+    let (pixels, w, h) = capture_warframe_pixels()?;
+    ocr_pixels_rect(&pixels, w, h, x_start, x_end, y_start, y_end)
+}
+
 /// DXGI Desktop Duplication capture — works for Fullscreen Exclusive (and all other modes).
 ///
 /// Dynamically determines which monitor the Warframe window is on so this works correctly
