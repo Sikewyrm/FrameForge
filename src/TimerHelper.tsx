@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import "./TimerHelper.css";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -27,6 +28,7 @@ interface WsCircuit  { expiry: string; normalFrames: string[]; hardWeapons: stri
 interface WsSimple   { expiry: string; }
 interface WsBounty   { expiry: string; jobCount: number; }
 interface WsEvent    { expiry: string; label: string; }
+interface WsNews     { message: string; link: string; date: string | number; stream: boolean; primeAccess: boolean; update: boolean; }
 
 export interface FissureWatch {
   id: string;
@@ -78,7 +80,8 @@ export interface WorldState {
   circuit?:        WsCircuit;
   kahl?:           WsSimple;
   deepArchimedea?: WsSimple;
-  activeEvent?:    WsEvent;
+  events?:         WsEvent[];
+  news?:           WsNews[];
   darvo?:          WsDarvo;
   alerts?:         WsAlert[];
   invasions?:      WsInvasion[];
@@ -435,9 +438,36 @@ export default function TimerHelper({ favorites, onFavoriteToggle, fissureWatche
         })()}
 
         {ws?.nightwave?.active && <TimerTile id="nightwave" label="Nightwave" state={`Season ${ws.nightwave.season}`} stateClass="st-neutral" expiry={ws.nightwave.expiry} />}
-        {ws?.activeEvent && <TimerTile label={ws.activeEvent.label} state="Event" stateClass="st-active" expiry={ws.activeEvent.expiry} />}
+        {ws?.events?.map(ev => (
+          <TimerTile key={ev.label} label={ev.label} state="Event" stateClass="st-active" expiry={ev.expiry} />
+        ))}
         {ws?.darvo && <TimerTile label={`Darvo: ${ws.darvo.item}`} state={`-${ws.darvo.discount}%`} stateClass="st-neutral" expiry={ws.darvo.expiry} until={`${ws.darvo.salePrice}p`} />}
       </div>
+
+      {/* ── News & Promotions ─────────────────────────────────────────────── */}
+      {ws?.news && ws.news.length > 0 && (
+        <>
+          <SectionHeader label="News &amp; Promotions" />
+          <div className="timer-section-grid">
+            {ws.news.map((item, i) => (
+              <div key={i} className="news-tile">
+                <div className="news-tile-msg">{item.message}</div>
+                <div className="news-tile-meta">
+                  <span className="news-tile-date">
+                    {new Date(item.date).toLocaleDateString("en-US", { month: "short", day: "numeric" })}
+                  </span>
+                  <div className="news-tile-tags">
+                    {item.primeAccess && <span className="news-tag news-tag-prime">Prime</span>}
+                    {item.stream      && <span className="news-tag news-tag-stream">Stream</span>}
+                    {item.update      && <span className="news-tag news-tag-update">Update</span>}
+                  </div>
+                  <button className="news-open-btn" onClick={() => openUrl(item.link)}>Open →</button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
 
       {/* ── Alerts ────────────────────────────────────────────────────────── */}
       {ws?.alerts && ws.alerts.length > 0 && (

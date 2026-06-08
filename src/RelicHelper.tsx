@@ -186,8 +186,6 @@ function RelicCard({ drop, catalogRelicByName, quantities, ownedPrimeNames, sear
   // Relic icon comes from the Intact catalog entry
   const intactCat = catalogRelicByName.get(`${baseLower} intact`);
 
-  if (total === 0) return null;
-
   // Find catalog item by name — returns item with best available image_name
   const findCatalogItem = (itemName: string): CatalogItem | undefined => {
     const n = itemName.toLowerCase();
@@ -241,7 +239,7 @@ function RelicCard({ drop, catalogRelicByName, quantities, ownedPrimeNames, sear
   ];
 
   return (
-    <div className={`relic-card${allComplete ? " relic-card-complete" : ""}`}>
+    <div className={`relic-card${total === 0 ? " relic-card-unowned" : allComplete ? " relic-card-complete" : ""}`}>
       <div className="relic-card-left">
         <div className="relic-card-icon-row">
           <RelicImg src={CDN(intactCat?.image_name)} />
@@ -336,6 +334,7 @@ export default function RelicHelper({ quantities, apiQuantities, refreshKey, col
   const [filterUnvaulted, setFilterUnvaulted] = useState(false);
   const [filterComplete,  setFilterComplete]  = useState(false);
   const [filterMissing,   setFilterMissing]   = useState(false);
+  const [showUnowned,     setShowUnowned]     = useState(false);
 
   const loadDrops = useCallback(() => {
     setDropLoading(true);
@@ -430,6 +429,7 @@ export default function RelicHelper({ quantities, apiQuantities, refreshKey, col
         || (d.relicName ?? "").toLowerCase().includes(searchQ)
         || d.rewards.some(r => (r.itemName ?? "").toLowerCase().includes(searchQ));
     })
+    .filter(d => showUnowned || getTotal(d) > 0)
     .filter(d => !filterOwned || getTotal(d) > 0)
     .filter(d => !filterTier  || (d.tier ?? "").toLowerCase() === filterTier)
     .filter(d => {
@@ -461,14 +461,14 @@ export default function RelicHelper({ quantities, apiQuantities, refreshKey, col
       }
       return (a.fullName ?? "").localeCompare(b.fullName ?? "");
     }),
-  [drops, searchQ, filterOwned, filterTier, filterVaulted, filterUnvaulted, filterComplete, filterMissing, sortMode, getTotal, catalogRelicByName, nameMap, quantities, ownedPrimeNames]);
+  [drops, searchQ, filterOwned, showUnowned, filterTier, filterVaulted, filterUnvaulted, filterComplete, filterMissing, sortMode, getTotal, catalogRelicByName, nameMap, quantities, ownedPrimeNames]);
 
   const ownedCount = useMemo(() =>
     drops.filter(d => getTotal(d) > 0).length,
   [drops, getTotal]);
 
   // Reset to first page whenever filters change
-  useEffect(() => { setPage(0); }, [searchQ, filterOwned, filterTier, filterVaulted, filterUnvaulted, filterComplete, filterMissing, sortMode]);
+  useEffect(() => { setPage(0); }, [searchQ, filterOwned, showUnowned, filterTier, filterVaulted, filterUnvaulted, filterComplete, filterMissing, sortMode]);
 
   const pagedDrops = visibleDrops.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
   const totalPages = Math.ceil(visibleDrops.length / PAGE_SIZE);
@@ -491,11 +491,12 @@ export default function RelicHelper({ quantities, apiQuantities, refreshKey, col
               onClick={() => setFilterTier(v => v === t.toLowerCase() ? null : t.toLowerCase())}>{t}</button>
           ))}
           <span className="fbar-sep"/>
-          <button className={`fchip ${filterOwned     ? "fchip-on" : ""}`} onClick={() => setFilterOwned(v => !v)}>Owned</button>
-          <button className={`fchip ${filterVaulted   ? "fchip-on" : ""}`} onClick={() => setFilterVaulted(v => !v)}>🔒 Vaulted</button>
-          <button className={`fchip ${filterUnvaulted ? "fchip-on" : ""}`} onClick={() => setFilterUnvaulted(v => !v)}>🔓 Unvaulted</button>
-          <button className={`fchip ${filterComplete  ? "fchip-on" : ""}`} onClick={() => setFilterComplete(v => !v)}>✓ All obtained</button>
-          <button className={`fchip ${filterMissing   ? "fchip-on" : ""}`} onClick={() => setFilterMissing(v => !v)}>✕ Missing items</button>
+          <button className={`fchip ${filterOwned     ? "fchip-on" : ""}`} onClick={() => { const n = !filterOwned;   setFilterOwned(n);   if (n) setShowUnowned(false); }}>Owned</button>
+          <button className={`fchip ${showUnowned    ? "fchip-on" : ""}`} onClick={() => { const n = !showUnowned;   setShowUnowned(n);   if (n) setFilterOwned(false); }}>Not owned</button>
+          <button className={`fchip ${filterVaulted   ? "fchip-on" : ""}`} onClick={() => { const n = !filterVaulted;  setFilterVaulted(n); if (n) setFilterUnvaulted(false); }}>🔒 Vaulted</button>
+          <button className={`fchip ${filterUnvaulted ? "fchip-on" : ""}`} onClick={() => { const n = !filterUnvaulted; setFilterUnvaulted(n); if (n) setFilterVaulted(false); }}>🔓 Unvaulted</button>
+          <button className={`fchip ${filterComplete  ? "fchip-on" : ""}`} onClick={() => { const n = !filterComplete; setFilterComplete(n); if (n) setFilterMissing(false); }}>✓ All obtained</button>
+          <button className={`fchip ${filterMissing   ? "fchip-on" : ""}`} onClick={() => { const n = !filterMissing;  setFilterMissing(n);  if (n) setFilterComplete(false); }}>✕ Missing items</button>
           <span className="fbar-sep"/>
           <span className="fbar-label">Sort:</span>
           <button className={`fchip ${sortMode === "count"  ? "fchip-on" : ""}`} onClick={() => setSortMode("count")}>Most owned</button>

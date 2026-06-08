@@ -322,28 +322,55 @@ export default function WfmTrading({ wfmLookup: _wfmLookup, wfmItems, quantities
   const [username, setUsername]         = useState<string | null>(null);
   const [checking, setChecking]         = useState(true);
   const [unread, setUnread]             = useState(0);
-  const [wfmStatus, setWfmStatus]       = useState<"online" | "ingame" | "invisible">("online");
+  const [wfmStatus, setWfmStatus]       = useState<"online" | "ingame" | "invisible" | "offline">("offline");
   const [statusBusy, setStatusBusy]     = useState(false);
   const [statusError, setStatusError]   = useState("");
 
-  // On mount: restore existing Rust session OR try saved credentials
+  const syncStatus = () => {
+    invoke<string>("wfm_fetch_status")
+      .then(s => {
+        if (s === "online" || s === "ingame" || s === "invisible" || s === "offline") {
+          setWfmStatus(s);
+        }
+      })
+      .catch(() => {});
+  };
+
+  // On mount: restore existing Rust session OR try saved credentials.
+  // Both paths return [username, status] — dots update with no extra network call.
   useEffect(() => {
     (async () => {
-      // Already logged in from a previous call in this session
-      const existing = await invoke<string | null>("wfm_get_session").catch(() => null);
-      if (existing) { setUsername(existing); onLoginChange(existing); setChecking(false); return; }
+      let resolvedUser: string | null = null;
 
-      // Try saved token
-      const creds = await invoke<[string, string] | null>("wfm_load_credentials").catch(() => null);
-      if (creds) {
-        try {
-          const u = await invoke<string>("wfm_set_jwt", { jwt: creds[1] });
-          setUsername(u); onLoginChange(u);
-        } catch { /* token expired — show login form */ }
+      const existing = await invoke<[string, string] | null>("wfm_get_session").catch(() => null);
+      if (existing) {
+        [resolvedUser] = existing;
+      } else {
+        const creds = await invoke<[string, string] | null>("wfm_load_credentials").catch(() => null);
+        if (creds) {
+          try {
+            [resolvedUser] = await invoke<[string, string]>("wfm_set_jwt", { jwt: creds[1] });
+          } catch { /* token expired — show login form */ }
+        }
+      }
+
+      if (resolvedUser) {
+        setUsername(resolvedUser);
+        onLoginChange(resolvedUser);
+        // Set invisible on every launch so the user controls when they appear online.
+        setWfmStatus("invisible");
+        invoke("wfm_set_status", { status: "invisible" }).catch(() => {});
       }
       setChecking(false);
     })();
   }, []); // eslint-disable-line
+
+  // Re-sync status every 5 minutes — WFM can reset it to offline after inactivity
+  useEffect(() => {
+    if (!username) return;
+    const id = setInterval(syncStatus, 5 * 60 * 1000);
+    return () => clearInterval(id);
+  }, [username]); // eslint-disable-line
 
   // Listen for whispers to increment badge
   useEffect(() => {
@@ -382,15 +409,20 @@ export default function WfmTrading({ wfmLookup: _wfmLookup, wfmItems, quantities
           </button>
         </div>
         <div className="wfm-session-info">
-          <div className="wfm-status-picker" title="Set your warframe.market status (persists 6 hours)">
+          <div className="wfm-status-picker"
+            title={wfmStatus === "offline"
+              ? "WFM set you offline — click a dot to reconnect"
+              : `Status: ${wfmStatus}. Click to change.`}>
             {(["online", "ingame", "invisible"] as const).map(s => (
               <button key={s} disabled={statusBusy}
                 className={`wfm-status-opt${wfmStatus === s ? " active" : ""} wfm-status-${s}`}
-                title={{ online: "Online", ingame: "In Game", invisible: "Invisible" }[s]}
+                title={{ online: "Set Online", ingame: "Set In Game", invisible: "Set Invisible" }[s]}
                 onClick={async () => {
                   setStatusBusy(true); setStatusError("");
-                  try { await invoke("wfm_set_status", { status: s }); setWfmStatus(s); }
-                  catch (e) { setStatusError(String(e)); }
+                  try {
+                    await invoke("wfm_set_status", { status: s });
+                    setWfmStatus(s);
+                  } catch (e) { setStatusError(String(e)); }
                   setStatusBusy(false);
                 }}>●</button>
             ))}

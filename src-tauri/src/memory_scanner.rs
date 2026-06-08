@@ -656,6 +656,99 @@ pub fn find_warframe_pid_pub() -> Option<u32> { find_warframe_pid() }
 #[cfg(not(target_os = "windows"))]
 pub fn find_warframe_pid_pub() -> Option<u32> { None }
 
+// ─── Riven validity flag scanner ──────────────────────────────────────────────
+//
+// GEP (gep_warframeext.dll) uses Pattern D-2 to locate a single byte in
+// Warframe's .text section that acts as an open/closed flag for the riven
+// reroll UI. The byte is non-zero while the screen is shown, zero when closed.
+//
+// Pattern D-2 (13 bytes):
+//   80 3d ?? ?? ?? ?? 00  48 8b ?? ??  0f 85
+//   CMP byte ptr [RIP+disp32], 0   MOV ...   JNZ ...
+//
+// Resolving the flag VA:
+//   The CMP instruction is 7 bytes. RIP at execution = match_va + 7.
+//   flag_va = (match_va + 7) + i32::from_le_bytes(bytes[2..6])
+
+#[cfg(target_os = "windows")]
+fn find_pattern_d2(data: &[u8], base_va: usize) -> Option<usize> {
+    let len = data.len();
+    if len < 13 { return None; }
+    for i in 0..len - 13 {
+        if data[i]    != 0x80 || data[i+1]  != 0x3d { continue; }
+        if data[i+6]  != 0x00 { continue; }
+        if data[i+7]  != 0x48 || data[i+8]  != 0x8b { continue; }
+        if data[i+11] != 0x0f || data[i+12] != 0x85 { continue; }
+        let disp = i32::from_le_bytes([data[i+2], data[i+3], data[i+4], data[i+5]]);
+        let flag_va = (base_va + i + 7) as i64 + disp as i64;
+        if flag_va > 0x10000 && flag_va < 0x7fff_ffff_ffff {
+            return Some(flag_va as usize);
+        }
+    }
+    None
+}
+
+/// Scan Warframe's executable image sections for the riven screen validity flag VA.
+/// Returns the virtual address of the single byte: non-zero = screen open, 0 = closed.
+/// Scans once; caller should cache the result and re-scan only on PID change.
+#[cfg(target_os = "windows")]
+pub fn find_riven_validity_va(pid: u32) -> Option<usize> {
+    use std::ffi::c_void;
+    use std::mem;
+    use windows_sys::Win32::{
+        Foundation::CloseHandle,
+        System::{
+            Diagnostics::Debug::ReadProcessMemory,
+            Memory::{VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT},
+            Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ},
+        },
+    };
+
+    let process = unsafe { OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, 0, pid) };
+    if process == 0 { return None; }
+
+    let mut result: Option<usize> = None;
+    let mut addr: usize = 0x10000;
+    let mbi_size = mem::size_of::<MEMORY_BASIC_INFORMATION>();
+    let start_time = std::time::Instant::now();
+
+    while start_time.elapsed().as_secs() < 60 && result.is_none() {
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { mem::zeroed() };
+        if unsafe { VirtualQueryEx(process, addr as *const c_void, &mut mbi, mbi_size) } == 0 { break; }
+        let region_end = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize);
+        if region_end <= addr { break; }
+        addr = region_end;
+
+        // Only scan committed, executable, memory-mapped PE image regions (MEM_IMAGE = 0x1000000).
+        // 0x20 = PAGE_EXECUTE_READ (normal .text), 0x40 = PAGE_EXECUTE_READWRITE (patched pages).
+        let is_exec_image = mbi.State == MEM_COMMIT
+            && matches!(mbi.Protect, 0x20 | 0x40)
+            && mbi.Type == 0x1000000
+            && mbi.RegionSize >= 13
+            && mbi.RegionSize <= 64 * 1024 * 1024;
+
+        if !is_exec_image { continue; }
+
+        let mut buf = vec![0u8; mbi.RegionSize];
+        let mut bytes_read = 0usize;
+        let ok = unsafe {
+            ReadProcessMemory(
+                process, mbi.BaseAddress as *const c_void,
+                buf.as_mut_ptr() as *mut c_void, mbi.RegionSize, &mut bytes_read,
+            )
+        };
+        if ok == 0 || bytes_read < 13 { continue; }
+
+        result = find_pattern_d2(&buf[..bytes_read], mbi.BaseAddress as usize);
+    }
+
+    unsafe { CloseHandle(process); }
+    result
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn find_riven_validity_va(_pid: u32) -> Option<usize> { None }
+
 #[cfg(target_os = "windows")]
 fn find_warframe_pid() -> Option<u32> {
     use windows_sys::Win32::{

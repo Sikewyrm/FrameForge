@@ -10,7 +10,7 @@ mod memory_scanner;
 mod ocr;
 mod wfcd;
 
-use db::{QuantityChange, Trade};
+use db::{QuantityChange, SnapshotPoint, Trade, TrackedItem};
 use wfcd::{RecipeComponent, WfcdItem};
 
 pub struct AppState {
@@ -43,6 +43,8 @@ pub struct AppState {
     pub wfm_price_cache: Mutex<HashMap<String, Option<u32>>>,
     /// Active WFM session (JWT + username). Held in memory only, never written to disk.
     pub wfm_session: Arc<Mutex<Option<WfmSession>>>,
+    /// Path to the persisted top-WFM-items cache (survives restarts).
+    pub wfm_top_cache_path: PathBuf,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
@@ -52,6 +54,7 @@ pub struct WfmSession {
     pub client_id: String,
     pub device_id: String,
     pub username: String,
+    pub status: String,   // "online" | "ingame" | "invisible" | "offline"
 }
 
 impl WfmSession {
@@ -120,8 +123,12 @@ fn fix_category(name: &str, wfcd_cat: &str) -> String {
 
 #[tauri::command]
 fn get_all_items(state: State<AppState>) -> Vec<CatalogItem> {
-    let items    = state.wfcd_items.lock().unwrap_or_else(|e| e.into_inner());
-    let bp_names = state.blueprint_to_result.lock().unwrap_or_else(|e| e.into_inner());
+    // Clone data and release locks immediately — the catalog build below is O(n²)
+    // and holding the locks blocks the monitor thread and other commands.
+    let items: Vec<wfcd::WfcdItem> = state.wfcd_items.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let bp_names: HashMap<String, (String, Option<u32>)> = state.blueprint_to_result.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let items = &items;
+    let bp_names = &bp_names;
 
     // ExportRecipes is the authoritative source for blueprint items — their paths
     // match what the Warframe API returns in data.Recipes.
@@ -749,8 +756,9 @@ fn wfm_receive_tokens(
         .call().map_err(|e| format!("Profile: {}", e))?
         .into_json().map_err(|e| format!("Parse: {}", e))?;
     let username = json["data"]["ingameName"].as_str().unwrap_or("Tenno").to_string();
+    let status   = json["data"]["status"].as_str().unwrap_or("offline").to_string();
     *state.wfm_session.lock().unwrap_or_else(|e| e.into_inner()) = Some(WfmSession {
-        access_token, refresh_token, client_id, device_id, username: username.clone(),
+        access_token, refresh_token, client_id, device_id, username: username.clone(), status,
     });
     if let Some(win) = app.get_webview_window("wfm-login") { let _ = win.close(); }
     let _ = app.emit("wfm-auth-complete", &username);
@@ -787,8 +795,9 @@ fn wfm_refresh_token(state: State<AppState>) -> Result<(), String> {
 }
 
 /// Restore a session from saved token data (JSON string).
+/// Returns (username, status) so the frontend can set both in one step.
 #[tauri::command]
-fn wfm_set_jwt(state: State<AppState>, jwt: String) -> Result<String, String> {
+fn wfm_set_jwt(state: State<AppState>, jwt: String) -> Result<(String, String), String> {
     // `jwt` here is a JSON string saved by wfm_save_credentials: { accessToken, refreshToken, ... }
     let data: serde_json::Value = serde_json::from_str(&jwt)
         .unwrap_or_else(|_| serde_json::json!({ "accessToken": jwt })); // backward compat
@@ -805,10 +814,11 @@ fn wfm_set_jwt(state: State<AppState>, jwt: String) -> Result<String, String> {
         .call().map_err(|e| format!("401: {}", e))?
         .into_json().map_err(|e| format!("Parse: {}", e))?;
     let username = json["data"]["ingameName"].as_str().unwrap_or("Tenno").to_string();
+    let status   = json["data"]["status"].as_str().unwrap_or("offline").to_string();
     *state.wfm_session.lock().unwrap_or_else(|e| e.into_inner()) = Some(WfmSession {
-        access_token, refresh_token, client_id, device_id, username: username.clone(),
+        access_token, refresh_token, client_id, device_id, username: username.clone(), status: status.clone(),
     });
-    Ok(username)
+    Ok((username, status))
 }
 
 /// Log in via v1 signin (current recommended method per WFM Discord).
@@ -836,6 +846,8 @@ fn wfm_login(state: State<AppState>, email: String, password: String) -> Result<
         .map_err(|e| format!("Parse: {}", e))?;
     let username = json["payload"]["user"]["ingame_name"]
         .as_str().unwrap_or("Tenno").to_string();
+    let status = json["payload"]["user"]["status"]
+        .as_str().unwrap_or("offline").to_string();
 
     *state.wfm_session.lock().unwrap_or_else(|e| e.into_inner()) = Some(WfmSession {
         access_token: token,
@@ -843,6 +855,7 @@ fn wfm_login(state: State<AppState>, email: String, password: String) -> Result<
         client_id: String::new(),
         device_id: String::new(),
         username: username.clone(),
+        status,
     });
     Ok(username)
 }
@@ -878,6 +891,211 @@ fn wfm_get_item_statistics(state: State<AppState>, url_name: String) -> Result<s
     let json: serde_json::Value = req.call().map_err(|e| format!("stats: {}", e))?
         .into_json().map_err(|e| format!("parse: {}", e))?;
     Ok(json["payload"]["statistics_closed"]["90days"].clone())
+}
+
+// ── Top WFM items by 7-day trade volume ───────────────────────────────────────
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct WfmTopItem {
+    pub name:           String,
+    pub url_name:       String,
+    pub image_name:     Option<String>,
+    pub unit_price:     u32,    // median sell price (plat)
+    pub daily_volume:   f64,    // average trades/day over last 7 days
+    pub total_value_7d: u64,    // unit_price × total volume over 7 days
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WfmTopDiskCache {
+    saved_at: u64,          // Unix seconds
+    items: Vec<WfmTopItem>,
+}
+
+/// Fetch all Prime Set (name, url_name) pairs from WFM's /v2/items endpoint.
+/// Returns empty vec if the request fails.
+fn fetch_wfm_prime_sets() -> Vec<(String, String)> {
+    wfm_wait();
+    let resp = ureq::get("https://api.warframe.market/v2/items")
+        .set("User-Agent", "FrameForge/1.2.0")
+        .timeout(std::time::Duration::from_secs(15))
+        .call();
+    let json: serde_json::Value = match resp {
+        Ok(r) => match r.into_json() { Ok(v) => v, Err(_) => return Vec::new() },
+        Err(_) => return Vec::new(),
+    };
+    // v2 format: { "data": [{ "slug": "ash_prime_set", "i18n": { "en": { "name": "Ash Prime Set" } } }] }
+    let items = match json["data"].as_array() {
+        Some(a) => a,
+        None => return Vec::new(),
+    };
+    items.iter()
+        .filter_map(|item| {
+            let name = item["i18n"]["en"]["name"].as_str()?;
+            let url  = item["slug"].as_str()?;
+            let lower = name.to_lowercase();
+            if lower.contains("prime") && lower.ends_with(" set") {
+                Some((name.to_string(), url.to_string()))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Return the session-scoped WFM prime sets, fetching once if not yet cached.
+fn get_or_fetch_wfm_prime_sets() -> Vec<(String, String)> {
+    let cache = WFM_PRIME_SETS_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    {
+        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref sets) = *guard {
+            return sets.clone();
+        }
+    }
+    let sets = fetch_wfm_prime_sets();
+    if !sets.is_empty() {
+        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(sets.clone());
+    }
+    sets
+}
+
+/// Fetch price + 7-day volume for a single WFM slug.
+/// Returns None if the item is not listed or has no recent data.
+fn wfm_stats_7day(slug: &str) -> Option<(u32, f64)> {
+    wfm_wait();
+    let url = format!("https://api.warframe.market/v1/items/{}/statistics", slug);
+    let json: serde_json::Value = ureq::get(&url)
+        .timeout(std::time::Duration::from_secs(10))
+        .call().ok()?.into_json().ok()?;
+
+    let days = json["payload"]["statistics_closed"]["90days"].as_array()?;
+    if days.is_empty() { return None; }
+
+    // Price: most recent entry's median
+    let price = days.last()?.get("median")?.as_f64().map(|f| f.round() as u32)?;
+
+    // Volume: sum of the last 7 daily entries
+    let vol_7d: f64 = days.iter().rev().take(7)
+        .filter_map(|e| e["volume"].as_f64())
+        .sum();
+
+    if vol_7d == 0.0 { return None; }
+    Some((price, vol_7d / 7.0))
+}
+
+/// Return the top 10 most-traded items on warframe.market by 7-day total value.
+/// Queries Prime Sets and Arcanes from the local WFCD catalog (already loaded).
+/// Results are cached for 3 hours so repeated tab opens are instant.
+#[tauri::command]
+async fn get_wfm_top_items(state: State<'_, AppState>) -> Result<Vec<WfmTopItem>, String> {
+    let cache = WFM_TOP_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+
+    // Return in-memory cached result if still fresh
+    {
+        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((ts, ref items)) = *guard {
+            if ts.elapsed().as_secs() < 3 * 3600 {
+                return Ok(items.clone());
+            }
+        }
+    }
+
+    // Try disk cache — survives app restarts
+    let disk_cache_path = state.wfm_top_cache_path.clone();
+    if let Ok(s) = std::fs::read_to_string(&disk_cache_path) {
+        if let Ok(dc) = serde_json::from_str::<WfmTopDiskCache>(&s) {
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+            if now_secs.saturating_sub(dc.saved_at) < 3 * 3600 && !dc.items.is_empty() {
+                // Populate in-memory cache so subsequent calls this session are instant
+                let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+                *guard = Some((std::time::Instant::now(), dc.items.clone()));
+                return Ok(dc.items);
+            }
+        }
+    }
+
+    // Only one scan at a time. If another is already running, wait for it to populate
+    // the cache rather than starting a second 90-second scan that would compete for the
+    // rate-limiter budget and double the total time.
+    if WFM_SCAN_RUNNING.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        for _ in 0..120u32 {  // poll every 5 s, max 10 minutes
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((ts, ref items)) = *guard {
+                if ts.elapsed().as_secs() < 3 * 3600 {
+                    return Ok(items.clone());
+                }
+            }
+        }
+        return Err("WFM top items scan timed out".to_string());
+    }
+
+    // Collect arcane candidates from WFCD without holding the lock across await points.
+    // Prime Sets come from WFM's own item list (fetched inside spawn_blocking below) so
+    // that we get canonical slugs — WFCD doesn't have set-level entries.
+    let arcane_candidates: Vec<(String, String, Option<String>)> = {
+        let items = state.wfcd_items.lock().map_err(|e| e.to_string())?;
+        items.iter()
+            .filter(|i| i.category == "Arcanes")
+            .map(|i| (i.name.clone(), to_wfm_slug(&i.name), i.image_name.clone()))
+            .collect()
+    };
+
+    // Run blocking ureq calls on the thread pool — keeps the async runtime free
+    let scan_result = tokio::task::spawn_blocking(move || {
+        // One API call to get all WFM prime sets (cached for the session after first call)
+        let prime_sets = get_or_fetch_wfm_prime_sets();
+
+        let mut out: Vec<WfmTopItem> = Vec::new();
+
+        for (name, url_name) in &prime_sets {
+            if let Some((price, daily_vol)) = wfm_stats_7day(url_name) {
+                out.push(WfmTopItem {
+                    name:           name.clone(),
+                    url_name:       url_name.clone(),
+                    image_name:     None,
+                    unit_price:     price,
+                    daily_volume:   daily_vol,
+                    total_value_7d: (price as f64 * daily_vol * 7.0) as u64,
+                });
+            }
+        }
+
+        for (name, slug, image_name) in &arcane_candidates {
+            if let Some((price, daily_vol)) = wfm_stats_7day(slug) {
+                out.push(WfmTopItem {
+                    name:           name.clone(),
+                    url_name:       slug.clone(),
+                    image_name:     image_name.clone(),
+                    unit_price:     price,
+                    daily_volume:   daily_vol,
+                    total_value_7d: (price as f64 * daily_vol * 7.0) as u64,
+                });
+            }
+        }
+
+        out.sort_by(|a, b| b.total_value_7d.cmp(&a.total_value_7d));
+        out.truncate(10);
+        out
+    }).await;
+
+    // Release the scan slot before propagating any error
+    WFM_SCAN_RUNNING.store(false, Ordering::SeqCst);
+
+    let results = scan_result.map_err(|e| e.to_string())?;
+
+    // Write to disk so the results survive an app restart
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    if let Ok(json) = serde_json::to_string(&WfmTopDiskCache { saved_at: now_secs, items: results.clone() }) {
+        let _ = std::fs::write(&disk_cache_path, json);
+    }
+
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    *guard = Some((std::time::Instant::now(), results.clone()));
+
+    Ok(results)
 }
 
 /// Save the WFM access token to Windows Credential Manager (encrypted by the OS).
@@ -965,11 +1183,29 @@ fn wfm_logout(state: State<AppState>) {
     *state.wfm_session.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
-/// Return the current WFM session username (no JWT exposed to frontend).
+/// Return (username, status) for the current session, or None if not logged in.
 #[tauri::command]
-fn wfm_get_session(state: State<AppState>) -> Option<String> {
+fn wfm_get_session(state: State<AppState>) -> Option<(String, String)> {
     state.wfm_session.lock().unwrap_or_else(|e| e.into_inner())
-        .as_ref().map(|s| s.username.clone())
+        .as_ref().map(|s| (s.username.clone(), s.status.clone()))
+}
+
+/// Fetch the user's actual current status from WFM (`/v2/me`).
+/// Returns one of: "online" | "ingame" | "invisible" | "offline".
+/// Call this after session restore so the UI reflects what WFM actually has,
+/// not just the hardcoded default.
+#[tauri::command]
+fn wfm_fetch_status(state: State<AppState>) -> Result<String, String> {
+    let token = state.wfm_session.lock().unwrap_or_else(|e| e.into_inner())
+        .as_ref().ok_or("Not logged in")?.access_token.clone();
+    wfm_wait();
+    let json: serde_json::Value = ureq::get("https://api.warframe.market/v2/me")
+        .set("Authorization", &format!("Bearer {}", token))
+        .set("language", "en").set("platform", "pc")
+        .set("User-Agent", "FrameForge/1.2.0")
+        .call().map_err(|e| format!("Status fetch: {}", e))?
+        .into_json().map_err(|e| format!("Parse: {}", e))?;
+    Ok(json["data"]["status"].as_str().unwrap_or("offline").to_string())
 }
 
 /// Return the current session token data as JSON for saving.
@@ -1011,6 +1247,7 @@ async fn wfm_set_status(state: State<'_, AppState>, status: String) -> Result<()
     }
     let token = state.wfm_session.lock().unwrap_or_else(|e| e.into_inner())
         .as_ref().ok_or("Not logged in")?.access_token.clone();
+    let status_for_ws = status.clone();
 
     tokio::task::spawn_blocking(move || -> Result<(), String> {
         use tungstenite::{connect, Message};
@@ -1045,7 +1282,7 @@ async fn wfm_set_status(state: State<'_, AppState>, status: String) -> Result<()
 
         // 2. Set status — 6-hour duration so it persists after disconnect
         send(&mut ws, "@wfm|cmd/status/set", serde_json::json!({
-            "status": status,
+            "status": status_for_ws,
             "duration": 21600   // max 6 hours
         }))?;
         wait_for(&mut ws, "@wfm|cmd/status/set:ok", "@wfm|cmd/status/set:error")?;
@@ -1054,7 +1291,13 @@ async fn wfm_set_status(state: State<'_, AppState>, status: String) -> Result<()
         Ok(())
     })
     .await
-    .map_err(|e| format!("Task: {}", e))?
+    .map_err(|e| format!("Task: {}", e))??;
+
+    // Keep cached status in sync so wfm_get_session reflects the new value
+    if let Some(s) = state.wfm_session.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        s.status = status;
+    }
+    Ok(())
 }
 
 // ─── Riven database ───────────────────────────────────────────────────────────
@@ -1136,30 +1379,40 @@ fn riven_abbrev_to_full(abbrev: &str) -> String {
         .unwrap_or_else(|| abbrev.to_string())
 }
 
-/// Parse spreadsheet stat string into slot groups.
-/// Space-separated tokens = each is its own required slot.
-/// Slash-separated tokens = any one of these fills that slot.
-/// "CD MS/TOX/DMG/FR/CC" → [[CD], [MS, TOX, DMG, FR, CC]]  (2 groups)
-/// "CD AS RANGE"          → [[CD], [AS], [RANGE]]            (3 groups, all required)
-/// "CC MS FR/CD/DMG/HEAT" → [[CC], [MS], [FR, CD, DMG, HEAT]] (3 groups)
-/// Multiple "or" paths are merged: all unique groups across all alternatives.
-fn parse_stat_groups(s: &str) -> Vec<Vec<String>> {
+/// Parse spreadsheet stat string into alternatives, each containing slot groups.
+/// "or" = completely separate valid build paths — scored independently.
+/// Space-separated = each token is its own required slot.
+/// Slash-separated = any one of these fills that slot.
+///
+/// "TOX DTC or TOX DTG or CD MS/TOX/FR" →
+///   [ [[TOX],[DTC]], [[TOX],[DTG]], [[CD],[MS,TOX,FR]] ]
+fn parse_stat_alternatives(s: &str) -> Vec<Vec<Vec<String>>> {
     let without_note = s.split('(').next().unwrap_or(s);
-    let mut all_groups: Vec<Vec<String>> = Vec::new();
+    let mut alternatives: Vec<Vec<Vec<String>>> = Vec::new();
     for alt in without_note.split(" or ") {
+        let mut groups: Vec<Vec<String>> = Vec::new();
         for token in alt.split_whitespace() {
             let options: Vec<String> = token.split('/')
                 .filter_map(|t| { let t = t.trim(); if t.is_empty() { None } else { Some(riven_abbrev_to_full(t)) } })
                 .collect();
-            if !options.is_empty() {
-                // Avoid duplicating groups that appear in multiple alternatives
-                if !all_groups.iter().any(|g| g == &options) {
-                    all_groups.push(options);
-                }
-            }
+            if !options.is_empty() { groups.push(options); }
+        }
+        if !groups.is_empty() { alternatives.push(groups); }
+    }
+    if alternatives.is_empty() { alternatives.push(vec![]); }
+    alternatives
+}
+
+/// Flat list helper — kept for the wanted display (unique stat names across all alternatives)
+fn parse_stat_groups(s: &str) -> Vec<Vec<String>> {
+    let alts = parse_stat_alternatives(s);
+    let mut all: Vec<Vec<String>> = Vec::new();
+    for alt in alts {
+        for group in alt {
+            if !all.iter().any(|g| g == &group) { all.push(group); }
         }
     }
-    all_groups
+    all
 }
 
 /// Flat dedup list of all stats across all groups — kept for backwards compat where needed.
@@ -1191,30 +1444,65 @@ fn csv_split_line(line: &str) -> Vec<String> {
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct RivenEntry {
     pub weapon: String,
-    /// Each inner Vec is one "slot group":
-    ///   - [single stat]    = required (space-separated in spreadsheet)
-    ///   - [A, B, C, ...]   = any one of these fills this slot (/-separated)
-    /// "CD MS/TOX/DMG" → [[CD], [MS, TOX, DMG]]
+    /// Outer Vec = "or" alternatives (each is a completely separate valid build).
+    /// Middle Vec = slot groups within that alternative.
+    /// Inner Vec  = options for that slot (slash-separated).
+    /// "TOX DTC or TOX DTG" → [[[TOX],[DTC]], [[TOX],[DTG]]]
+    pub stat_alternatives: Vec<Vec<Vec<String>>>,
+    /// Flat dedup list for backwards-compat display (unique groups across all alternatives)
     pub stat_groups: Vec<Vec<String>>,
     pub safe_negatives: Vec<String>,
     pub notes: String,
 }
 
+#[derive(serde::Serialize, Clone)]
+pub struct AlternativeResult {
+    pub label: String,        // "Option 1", "Option 2", etc.
+    pub matched: Vec<String>,
+    pub missing: Vec<String>,
+    pub score: f32,
+    pub verdict: String,
+}
+
 #[derive(serde::Serialize)]
 pub struct RivenAnalysis {
     pub weapon: String,
-    pub matched_positives: Vec<String>,
-    pub missing_positives: Vec<String>,
+    pub matched_positives: Vec<String>,   // best alternative
+    pub missing_positives: Vec<String>,   // best alternative
     pub safe_negatives_present: Vec<String>,
     pub harmful_negatives: Vec<String>,
     pub total_wanted: usize,
     pub score: f32,
     pub verdict: String,
     pub notes: String,
+    pub alternatives: Vec<AlternativeResult>, // one per "or" path
 }
 
 static RIVEN_DB: std::sync::OnceLock<std::sync::Mutex<HashMap<String, RivenEntry>>> =
     std::sync::OnceLock::new();
+
+/// Cache for top WFM items: (fetched_at, items). Refreshed when older than 3 hours.
+static WFM_TOP_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<(std::time::Instant, Vec<WfmTopItem>)>>> =
+    std::sync::OnceLock::new();
+
+/// Guards against concurrent scans: only one get_wfm_top_items scan runs at a time.
+/// Concurrent callers wait (polling the cache) rather than starting a second scan.
+static WFM_SCAN_RUNNING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Session-scoped cache for WFM prime set slugs (name, url_name).
+/// Populated once per app session from the WFM /v1/items list.
+static WFM_PRIME_SETS_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<Vec<(String, String)>>>> =
+    std::sync::OnceLock::new();
+
+/// Cache: (warframe_pid, Option<flag_va>). None inner = scanned this PID, pattern not found.
+/// Re-scanned only when PID changes (game restart). Prevents 200ms re-scan storm.
+static RIVEN_FLAG_VA: std::sync::OnceLock<std::sync::Mutex<Option<(u32, Option<usize>)>>> =
+    std::sync::OnceLock::new();
+
+/// Guard: prevents spawning multiple watcher threads if start_riven_memory_watcher is called again.
+static RIVEN_WATCHER_RUNNING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 fn get_riven_db() -> &'static std::sync::Mutex<HashMap<String, RivenEntry>> {
     RIVEN_DB.get_or_init(|| {
@@ -1264,11 +1552,12 @@ fn parse_riven_csv(csv: &str) -> HashMap<String, RivenEntry> {
         if f.len() < neg_col + 1 { continue; }
         let weapon = f[0].trim().to_lowercase();
         if weapon.is_empty() { continue; }
+        let stat_alternatives = parse_stat_alternatives(&f[1]);
         let stat_groups = parse_stat_groups(&f[1]);
         let safe_neg    = parse_riven_stat_str(&f[neg_col]);
         let raw_notes   = f.get(notes_col).map(|s| s.trim().trim_matches('"').to_string()).unwrap_or_default();
         let notes       = expand_abbrevs_in_notes(&raw_notes);
-        map.insert(weapon.clone(), RivenEntry { weapon, stat_groups, safe_negatives: safe_neg, notes });
+        map.insert(weapon.clone(), RivenEntry { weapon, stat_alternatives, stat_groups, safe_negatives: safe_neg, notes });
     }
     map
 }
@@ -1773,29 +2062,43 @@ fn start_log_watcher(app: tauri::AppHandle) -> Result<(), String> {
             let cooldown_ok = last_riven_fire
                 .map_or(true, |t| t.elapsed().as_secs() >= 4);
 
-            // Auto-trigger disabled — user triggers manually via "Check Riven" button.
-            // Keeping last_riven_fire updated so VolumetricFog close still works.
             if riven_trigger && cooldown_ok {
                 last_riven_fire = Some(std::time::Instant::now());
-                let _ = app.emit("ff-status", "🎲 Riven screen open — click Check Riven to analyse");
+                let _ = app.emit("riven-screen-open", ());
+                let _ = app.emit("ff-status", "🎲 Riven screen detected");
             }
 
-            // ── Riven screen close ────────────────────────────────────────────
-            // WM_ACTIVATEAPP 0 fires when Warframe loses focus — but it also fires
-            // momentarily when we open the overlay window. Apply a 5-second grace period
-            // after the last trigger so that false-closes from the overlay opening are ignored.
-            // ── Riven screen close — orbiter scene reload ─────────────────────
-            // When the player exits the riven screen, the game reloads the orbiter
-            // scene which creates VolumetricFog render targets. This is far more
-            // reliable than WM_ACTIVATEAPP 0 (which fires on alt-tab too).
-            // Guard: only fire if riven screen was recently active (< 10 min).
+            // ── Riven screen close — card UI hidden (primary) ─────────────────
+            // DiegeticArtifactCards.lua: DBG: HudVis 0 fires when the mod card
+            // overlay is hidden — the most direct signal the riven screen closed.
+            // Guard: only fire ≥1 s after the open trigger (so open+close in the
+            // same EE.log buffer don't cancel each other out).
+            if lower.contains("digeticartifactcards.lua: dbg: hudvis 0") {
+                let riven_active = last_riven_fire.map_or(false, |t| {
+                    let e = t.elapsed().as_secs();
+                    e >= 1 && e < 600
+                });
+                if riven_active {
+                    last_riven_fire = None;
+                    let riven_log = std::env::temp_dir().join("frameforge_riven_session.txt");
+                    let ts = chrono::Local::now().format("%H:%M:%S%.3f").to_string();
+                    let _ = append_to_file(&riven_log, &format!(
+                        "[STEP 4] CLOSE (DiegeticArtifactCards HudVis 0) — {}\n\n", ts
+                    ));
+                    let _ = app.emit("riven-screen-close", ());
+                }
+            }
+
+            // ── Riven screen close — orbiter scene reload (fallback) ──────────
+            // When the player exits the riven screen, the orbiter scene reloads
+            // and creates VolumetricFog render targets. Kept as a fallback in case
+            // the HudVis 0 trigger is missed.
             if lower.contains("creating render target: /ee/materials/volumetricfog") {
                 let riven_active = last_riven_fire.map_or(false, |t| {
                     let e = t.elapsed().as_secs();
-                    e >= 3 && e < 600 // at least 3s after trigger (not a false-fire on open)
+                    e >= 3 && e < 600
                 });
                 if riven_active {
-                    // Reset so this doesn't fire again for the same session
                     last_riven_fire = None;
                     let riven_log = std::env::temp_dir().join("frameforge_riven_session.txt");
                     let ts = chrono::Local::now().format("%H:%M:%S%.3f").to_string();
@@ -1944,6 +2247,118 @@ fn riven_screen_visible() -> bool {
     fits_in_visible
 }
 
+/// Read the single validity-flag byte that Overwolf GEP uses to track the riven reroll screen.
+/// Non-zero = screen open; 0 = closed. Returns true on any error (fail-open avoids false closes).
+/// The VA is found once via Pattern D-2 and cached; re-scanned only when the game restarts.
+#[tauri::command]
+/// Read the riven validity flag byte. Returns None if Warframe is not running.
+/// Returns Some(true) = screen open, Some(false) = screen closed.
+/// Fails open (Some(true)) on read errors so the overlay is never falsely dismissed.
+#[cfg(target_os = "windows")]
+fn read_riven_flag_byte() -> Option<bool> {
+    use windows_sys::Win32::{
+        Foundation::CloseHandle,
+        System::{
+            Diagnostics::Debug::ReadProcessMemory,
+            Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ},
+        },
+    };
+    use std::ffi::c_void;
+
+    let pid = memory_scanner::find_warframe_pid_pub()?;
+
+    let cache = RIVEN_FLAG_VA.get_or_init(|| std::sync::Mutex::new(None));
+    let mut cached = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if cached.map_or(true, |(p, _)| p != pid) {
+        // Scan once per PID. Store (pid, None) if pattern not found so we don't re-scan every 200ms.
+        let va = memory_scanner::find_riven_validity_va(pid);
+        *cached = Some((pid, va));
+    }
+    let flag_va = match *cached {
+        Some((_, Some(va))) => va,
+        // Pattern not found for this PID — return None so the watcher ignores this tick.
+        // Do NOT fail-open here: that would fire a false open event on every app start.
+        Some((_, None)) | None => { return None; }
+    };
+    drop(cached);
+
+    let handle = unsafe { OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, 0, pid) };
+    if handle == 0 { return Some(true); }
+
+    let mut byte: u8 = 0;
+    let mut read = 0usize;
+    let ok = unsafe {
+        ReadProcessMemory(handle, flag_va as *const c_void,
+            &mut byte as *mut u8 as *mut c_void, 1, &mut read)
+    };
+    unsafe { CloseHandle(handle); }
+
+    if ok == 0 || read == 0 { return Some(true); } // read failed — fail open
+    Some(byte != 0)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn read_riven_flag_byte() -> Option<bool> { None }
+
+/// Background thread: polls the riven validity flag every 200 ms and emits
+/// riven-screen-open-mem / riven-screen-close-mem on state transitions.
+/// Open fires on the first non-zero reading (fast). Close requires 2 consecutive
+/// zero readings (400 ms) to avoid false dismissals.
+#[tauri::command]
+fn start_riven_memory_watcher(app: tauri::AppHandle) {
+    use std::sync::atomic::Ordering;
+    if RIVEN_WATCHER_RUNNING.swap(true, Ordering::SeqCst) {
+        return; // already running — don't spawn a second thread
+    }
+    std::thread::spawn(move || {
+        let mut prev_open = false;
+        let mut close_streak: u8 = 0;
+        let mut warframe_was_running = false;
+
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+
+            let pid_found = memory_scanner::find_warframe_pid_pub().is_some();
+            if !pid_found {
+                // Warframe not running — reset state
+                if warframe_was_running {
+                    prev_open = false;
+                    close_streak = 0;
+                    warframe_was_running = false;
+                }
+                continue;
+            }
+            warframe_was_running = true;
+
+            match read_riven_flag_byte() {
+                None => {
+                    // Warframe running but pattern VA not found yet — don't change state,
+                    // just wait. This avoids a false open event on app start.
+                }
+                Some(true) => {
+                    close_streak = 0;
+                    if !prev_open {
+                        prev_open = true;
+                        let _ = app.emit("riven-screen-open-mem", ());
+                    }
+                }
+                Some(false) => {
+                    if prev_open {
+                        close_streak += 1;
+                        if close_streak >= 2 {
+                            prev_open = false;
+                            close_streak = 0;
+                            let _ = app.emit("riven-screen-close-mem", ());
+                        }
+                    } else {
+                        close_streak = 0;
+                    }
+                }
+            }
+        }
+    });
+}
+
 /// Write an error into the riven session log (called from TypeScript when OCR command fails).
 #[tauri::command]
 fn ocr_riven_log_error(error: String) {
@@ -1952,6 +2367,45 @@ fn ocr_riven_log_error(error: String) {
     let _ = append_to_file(&path, &format!(
         "[STEP 2] OCR COMMAND FAILED — {}\n└─ Error: {}\n\n", ts, error
     ));
+}
+
+// ── Saved rivens commands ─────────────────────────────────────────────────────
+
+#[tauri::command]
+fn save_riven_roll(
+    state: tauri::State<'_, AppState>,
+    weapon: String, label: String, stats_json: String,
+    verdict: String, score: f64,
+) -> Result<String, String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    let count = crate::db::count_saved_rivens(&conn).unwrap_or(0);
+    if count >= 50 {
+        return Err("Maximum of 50 saved rivens reached. Delete some to save more.".into());
+    }
+    let id = format!("{:x}", std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
+    let saved_at = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+    let riven = crate::db::SavedRiven { id: id.clone(), weapon, label, stats_json, verdict, score, saved_at };
+    crate::db::save_riven(&conn, &riven).map_err(|e| e.to_string())?;
+    Ok(id)
+}
+
+#[tauri::command]
+fn get_saved_riven_rolls(state: tauri::State<'_, AppState>) -> Result<Vec<crate::db::SavedRiven>, String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    crate::db::get_saved_rivens(&conn).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn delete_saved_riven_roll(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    crate::db::delete_saved_riven(&conn, &id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn rename_saved_riven_roll(state: tauri::State<'_, AppState>, id: String, label: String) -> Result<(), String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    crate::db::rename_saved_riven(&conn, &id, &label).map_err(|e| e.to_string())
 }
 
 /// Return all weapon names that have riven data.
@@ -1982,33 +2436,64 @@ fn analyze_riven(weapon: String, positives: Vec<String>, negatives: Vec<String>)
 
     let normalize = |s: &str| s.to_lowercase();
 
-    // Score per group: space-separated = each is its own slot; slash-separated = any one fills a slot.
-    // "CD MS/TOX/DMG" has 2 groups. Rolling CD+MS = 2/2 = 100%, not 2/7.
-    let mut matched: Vec<String> = Vec::new();
-    let mut missing: Vec<String> = Vec::new(); // one formatted string per unmatched group
-
-    for group in &entry.stat_groups {
-        let hit = positives.iter().find(|p| group.iter().any(|g| normalize(g) == normalize(p)));
-        if let Some(stat) = hit {
-            matched.push(stat.clone());
-        } else {
-            // Format: "Critical Damage" for single, "Multishot / Toxicity / Fire Rate" for group
-            missing.push(group.join(" / "));
+    // Score every "or" alternative independently — collect all results, pick best.
+    let make_verdict = |s: f32, neg_ok: bool| -> String {
+        match (s, neg_ok) {
+            (s, true)  if s >= 0.80 => "GREAT ROLL — Consider keeping".into(),
+            (s, true)  if s >= 0.60 => "GOOD ROLL — Decent for selling".into(),
+            (s, _)     if s >= 0.40 => "MEDIOCRE — Keep rolling".into(),
+            _                        => "BAD ROLL — Keep rolling".into(),
         }
+    };
+    // neg_ok = no harmful negatives rolled (i.e. rolled negs are NOT in the bad list)
+    let neg_ok_pre = negatives.iter().all(|neg| {
+        !entry.safe_negatives.iter().any(|s| normalize(s) == normalize(neg))
+    });
+
+    let mut all_alternatives: Vec<AlternativeResult> = Vec::new();
+    let mut best_matched: Vec<String> = Vec::new();
+    let mut best_missing: Vec<String> = Vec::new();
+    let mut best_score: f32 = -1.0_f32;
+
+    for (idx, alternative) in entry.stat_alternatives.iter().enumerate() {
+        if alternative.is_empty() { continue; }
+        let mut m: Vec<String> = Vec::new();
+        let mut ms: Vec<String> = Vec::new();
+        for group in alternative {
+            let hit = positives.iter().find(|p| group.iter().any(|g| normalize(g) == normalize(p)));
+            if let Some(stat) = hit { m.push(stat.clone()); }
+            else { ms.push(group.join(" / ")); }
+        }
+        let s = m.len() as f32 / alternative.len() as f32;
+        let label = if entry.stat_alternatives.len() == 1 {
+            "Build".to_string()
+        } else {
+            format!("Option {}", idx + 1)
+        };
+        all_alternatives.push(AlternativeResult {
+            label, matched: m.clone(), missing: ms.clone(),
+            score: s, verdict: make_verdict(s, neg_ok_pre),
+        });
+        let better = s > best_score || (s == best_score && m.len() > best_matched.len());
+        if better { best_score = s; best_matched = m; best_missing = ms; }
     }
 
+    let matched = best_matched;
+    let missing = best_missing;
+    let score   = if best_score < 0.0 { 0.0 } else { best_score };
+    let total   = entry.stat_alternatives.iter().map(|a| a.len()).min().unwrap_or(1).max(1);
+
+    // The spreadsheet "NEGATIVE STATS" column lists HARMFUL negatives to avoid.
+    // Any negative NOT in that list is safe (doesn't matter for this weapon).
     let mut safe_present: Vec<String> = Vec::new();
     let mut harmful: Vec<String> = Vec::new();
     for neg in &negatives {
         if entry.safe_negatives.iter().any(|s| normalize(s) == normalize(neg)) {
-            safe_present.push(neg.clone());
+            harmful.push(neg.clone());      // listed = BAD for this weapon
         } else {
-            harmful.push(neg.clone());
+            safe_present.push(neg.clone()); // not listed = safe/irrelevant
         }
     }
-
-    let total = entry.stat_groups.len().max(1);
-    let score = matched.len() as f32 / total as f32;
     let neg_ok = harmful.is_empty();
 
     let verdict = match (score, neg_ok) {
@@ -2028,6 +2513,7 @@ fn analyze_riven(weapon: String, positives: Vec<String>, negatives: Vec<String>)
         score,
         verdict,
         notes: entry.notes.clone(),
+        alternatives: all_alternatives,
     })
 }
 
@@ -2212,6 +2698,32 @@ fn wfm_price_for_slug(slug: &str) -> Result<Option<u32>, String> {
 fn get_change_log(state: State<AppState>, limit: i64) -> Result<Vec<QuantityChange>, String> {
     let conn = state.conn.lock().map_err(|e| e.to_string())?;
     db::get_quantity_changes(&conn, limit).map_err(|e| e.to_string())
+}
+
+// ─── Tracked items / snapshots ───────────────────────────────────────────────
+
+#[tauri::command]
+fn get_tracked_items(state: State<AppState>) -> Result<Vec<TrackedItem>, String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    db::get_tracked_items(&conn).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn add_tracked_item(state: State<AppState>, unique_name: String, display_name: String) -> Result<(), String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    db::add_tracked_item(&conn, &unique_name, &display_name).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn remove_tracked_item(state: State<AppState>, unique_name: String) -> Result<(), String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    db::remove_tracked_item(&conn, &unique_name).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_item_snapshots(state: State<AppState>, unique_name: String, days: Option<u32>) -> Result<Vec<SnapshotPoint>, String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    db::get_snapshots(&conn, &unique_name, days).map_err(|e| e.to_string())
 }
 
 // ─── Trade log ────────────────────────────────────────────────────────────────
@@ -2404,6 +2916,9 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
         // This filters out transient reads: mission reward screens, clan showcases,
         // open-world drop popups — all appear for only 1 scan cycle.
         let mut pending: HashMap<String, (i64, u8)> = HashMap::new();
+        // Track the last date we recorded daily snapshots (YYYY-MM-DD).
+        // Initialise to yesterday so the first scan of a new day always fires.
+        let mut last_snapshot_date = String::new();
 
         while flag.load(Ordering::SeqCst) {
             let result = memory_scanner::scan_warframe_memory(&unique_names, &display_names);
@@ -2550,6 +3065,18 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                 warframe_running: result.warframe_running,
                 scanned_at: now,
             });
+
+            // ── Daily item snapshots ─────────────────────────────────────────
+            let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+            if today != last_snapshot_date {
+                last_snapshot_date = today.clone();
+                if let Ok(tracked) = db::get_tracked_items(&conn) {
+                    for item in &tracked {
+                        let qty = *known.get(&item.unique_name).unwrap_or(&0);
+                        let _ = db::record_snapshot(&conn, &item.unique_name, &today, qty);
+                    }
+                }
+            }
 
             std::thread::sleep(std::time::Duration::from_secs(10));
         }
@@ -4086,18 +4613,20 @@ fn parse_worldstate_value(raw: &serde_json::Value, now_ms: i64, catalog: &std::c
         })
         .unwrap_or(Value::Null);
 
-    // ── Active Goal / Community Event ─────────────────────────────────────
-    let active_event = raw["Goals"].as_array()
-        .and_then(|a| a.iter().find(|g| {
-            ws_ms(&g["Expiry"]) > now_ms
-        }))
-        .map(|g| {
-            let expiry_ms = ws_ms(&g["Expiry"]);
-            let desc = g["Desc"].as_str().unwrap_or("");
-            let label = loc(desc);
-            json!({ "expiry": ms_to_iso(expiry_ms), "label": label })
-        })
-        .unwrap_or(Value::Null);
+    // ── Active Goals / Events ──────────────────────────────────────────────
+    let events: Vec<Value> = raw["Goals"].as_array()
+        .map(|a| a.iter()
+            .filter(|g| ws_ms(&g["Expiry"]) > now_ms)
+            .filter_map(|g| {
+                let expiry_ms = ws_ms(&g["Expiry"]);
+                let desc = g["Desc"].as_str().unwrap_or("");
+                let label = loc(desc);
+                if label.is_empty() { return None; }
+                Some(json!({ "expiry": ms_to_iso(expiry_ms), "label": label }))
+            })
+            .collect()
+        )
+        .unwrap_or_default();
 
     json!({
         "cetus": cetus, "vallis": vallis, "cambion": cambion, "zariman": zariman,
@@ -4105,7 +4634,7 @@ fn parse_worldstate_value(raw: &serde_json::Value, now_ms: i64, catalog: &std::c
         "sortie": sortie, "archonHunt": archon_hunt,
         "voidTrader": void_trader, "primeResurgence": prime_resurgence, "nightwave": nightwave,
         "circuit": circuit, "kahl": kahl, "deepArchimedea": deep_archimedea,
-        "activeEvent": active_event,
+        "events": events,
         "darvo": darvo,
         "alerts": alerts,
         "invasions": invasions,
@@ -4135,7 +4664,40 @@ async fn fetch_worldstate(state: State<'_, AppState>) -> Result<serde_json::Valu
             .map_err(|e| format!("worldstate fetch failed: {}", e))?
             .into_json::<serde_json::Value>()
             .map_err(|e| format!("worldstate parse failed: {}", e))?;
-        Ok(parse_worldstate_value(&raw, now_ms, &catalog))
+        let mut result = parse_worldstate_value(&raw, now_ms, &catalog);
+
+        // Fetch news/promotions from Steam — official Warframe community announcements only.
+        // warframestat.us/pc/news was removed from that API entirely.
+        let news: Vec<serde_json::Value> = ureq::get(
+            "https://api.steampowered.com/ISteamNews/GetNewsForApp/v2/?appid=230410&count=10&maxlength=500&format=json"
+        )
+            .set("User-Agent", "FrameForge/1.0")
+            .timeout(std::time::Duration::from_secs(10))
+            .call()
+            .ok()
+            .and_then(|r| r.into_json::<serde_json::Value>().ok())
+            .and_then(|v| v["appnews"]["newsitems"].as_array().cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|item| item["feed_type"].as_i64().unwrap_or(0) == 1)
+            .map(|item| {
+                let title = item["title"].as_str().unwrap_or("").to_string();
+                let lower = title.to_lowercase();
+                let ts_ms = item["date"].as_i64().unwrap_or(0) * 1000;
+                serde_json::json!({
+                    "message":     title,
+                    "link":        item["url"].as_str().unwrap_or(""),
+                    "date":        ts_ms,
+                    "stream":      false,
+                    "primeAccess": lower.contains("prime access") || lower.contains("prime "),
+                    "update":      lower.contains("update") || lower.contains("patch notes"),
+                })
+            })
+            .collect();
+        if let Some(obj) = result.as_object_mut() {
+            obj.insert("news".to_string(), serde_json::json!(news));
+        }
+        Ok(result)
     })
     .await
     .map_err(|e| format!("task error: {}", e))?
@@ -4336,6 +4898,7 @@ pub fn run() {
     let quantities_cache_path = data_dir.join("quantities_cache.json");
     let settings_path = data_dir.join("settings.json");
     let log_path = data_dir.join("scan_log.txt");
+    let wfm_top_cache_path = data_dir.join("wfm_top_cache.json");
 
     let conn = db::init_db(&db_path).expect("Failed to initialize database");
 
@@ -4371,6 +4934,7 @@ pub fn run() {
             monitor_active: Arc::new(AtomicBool::new(false)),
             wfm_price_cache: Mutex::new(HashMap::new()),
             wfm_session: Arc::new(Mutex::new(None)),
+            wfm_top_cache_path,
         })
         .setup(|app| {
             use tauri::Manager;
@@ -4392,6 +4956,10 @@ pub fn run() {
             get_item_list_status,
             fetch_item_list,
             get_change_log,
+            get_tracked_items,
+            add_tracked_item,
+            remove_tracked_item,
+            get_item_snapshots,
             get_trades,
             add_trade,
             delete_trade,
@@ -4407,12 +4975,18 @@ pub fn run() {
             get_relic_rewards,
             fetch_wfm_items,
             fetch_wfm_price,
+            get_wfm_top_items,
             get_item_price,
             wfm_set_status,
             start_log_watcher,
             ocr_riven_log_error,
+            start_riven_memory_watcher,
             riven_screen_visible,
             riven_screen_status,
+            save_riven_roll,
+            get_saved_riven_rolls,
+            delete_saved_riven_roll,
+            rename_saved_riven_roll,
             get_riven_weapons,
             reload_riven_database,
             analyze_riven,
@@ -4433,6 +5007,7 @@ pub fn run() {
             wfm_login,
             wfm_logout,
             wfm_get_session,
+            wfm_fetch_status,
             wfm_get_orders,
             wfm_get_item_info,
             wfm_create_order,

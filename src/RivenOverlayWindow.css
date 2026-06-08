@@ -62,6 +62,19 @@ body { background: transparent; overflow: hidden; }
 }
 .rov-compare-btn:hover { background: rgba(56,139,253,.28); }
 
+.rov-save-btn {
+  background: none;
+  border: none;
+  color: rgba(139,148,158,.6);
+  font-size: 12px;
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 4px;
+  line-height: 1;
+  transition: color 0.15s;
+}
+.rov-save-btn:hover { color: #3fb950; }
+
 .rov-close-btn {
   background: none;
   border: none;
@@ -209,6 +222,25 @@ body { background: transparent; overflow: hidden; }
   text-transform: uppercase;
   letter-spacing: .5px;
   margin-bottom: 4px;
+}
+
+/* ── Alternative build cards in overlay ── */
+.rov-alt-card {
+  border-top: 1px solid rgba(255,255,255,.06);
+  padding-top: 6px;
+}
+.rov-alt-card:first-child { border-top: none; padding-top: 0; }
+.rov-alt-label {
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  color: rgba(139,148,158,.55);
+  background: rgba(255,255,255,.06);
+  border-radius: 3px;
+  padding: 1px 5px;
+  display: inline-block;
+  margin-bottom: 3px;
 }
 
 /* ── Missing wanted stats ── */

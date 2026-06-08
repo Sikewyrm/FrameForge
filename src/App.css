@@ -473,6 +473,8 @@ svg.item-img-fallback { background: transparent; border: none; padding: 0; }
 }
 .relic-card:hover { border-color: rgba(56,139,253,.4); }
 .relic-card-complete { border-color: rgba(240,192,64,.55) !important; background: rgba(240,192,64,.03); }
+.relic-card-unowned { opacity: .45; }
+.relic-card-unowned:hover { opacity: .7; border-color: rgba(139,148,158,.4) !important; }
 
 /* Left info panel */
 .relic-card-left {

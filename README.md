@@ -1,4 +1,4 @@
-# FrameForge — Warframe Companion `v1.5.0`
+# FrameForge — Warframe Companion `v1.6.0`
 
 A desktop companion for Warframe that shows your live inventory, tracks crafting recipes, displays market prices, runs a full trading desk, manages a live timer dashboard, auto-detects relic reward screens, and analyses riven mods — all without modifying the game.
 
@@ -61,8 +61,8 @@ We are actively seeking official clarification from Digital Extremes. If DE conf
 ### Warframe Companion API — Optional & Opt-In
 The connection to `api.warframe.com/api/inventory.php` (which adds mod ranks and detailed inventory data) is **disabled by default**. It can be enabled in Settings under "Warframe Companion API" with a clear warning. We are awaiting official clarification from Digital Extremes on whether this endpoint is permitted for community tools. The app works fully without it — all core features use the read-only memory scanner only.
 
-### Statistics — Trade Tracker & Reports
-A full trade history and analytics dashboard, automatically populated from your activity:
+### Statistics — Trade Tracker, Reports & Item History
+A full trade history, analytics dashboard, and per-item quantity tracking — all automatically populated from your activity:
 
 **Trades tab:**
 - Every in-game trade is detected automatically from `EE.log` the moment "The trade was successful!" appears — no button to press
@@ -72,12 +72,18 @@ A full trade history and analytics dashboard, automatically populated from your 
 - Trades with multiple different items are recorded as a comma-separated list
 
 **Reports tab:**
-- Date range filter: Today / 7 Days / 30 Days / 90 Days / YTD / 1 Year / All Time
+- Date range filter: 7 Days / 30 Days / 90 Days / All Time
 - KPI cards: total earned, total spent, net profit, average per trade
 - **Cumulative platinum chart** — running net profit over time
 - **Daily bar chart** — green bars on days you earned, red bars on days you spent
 - **Items breakdown table** — every item with # sold, # bought, average sell price, and net platinum; sorted by most profitable
 - **Top trading partners** — top 10 players by total platinum exchanged
+
+**Item Report tab:**
+- Add any catalog item to your tracking list
+- A daily snapshot is recorded automatically each time the app is open
+- View a quantity history chart over the past 7 / 30 / 90 days or all time
+- Track farming progress, set completion, or any item you care about over time
 
 ### Riven Analyzer
 A dedicated tab for analysing riven mod rolls against the community-curated Sikewyrm spreadsheet (413+ weapons across all categories):
@@ -89,6 +95,7 @@ A dedicated tab for analysing riven mod rolls against the community-curated Sike
 - **Wanted stat list** — missing wanted groups shown compactly at the bottom (e.g. "Wanted: Multishot, Base Damage / Fire Rate / Toxicity").
 - **Database notes** — build context from the spreadsheet shown inline (e.g. minimum CC thresholds for Eidolon builds).
 - **All weapon types** — primary, secondary, melee, archwing weapons. Database refreshes via the ↻ button.
+- **Save rolls** — save up to 50 riven rolls with custom labels, edit inline, and delete when done. Useful for tracking a reroll session or comparing candidates before deciding.
 
 ### OCR Relic Reward Overlay
 When a void fissure reward screen opens in-game, FrameForge automatically captures and reads all four reward cards using Windows OCR and displays a transparent overlay with each item's platinum price, ducat value, and set completion — so you can pick the best reward instantly without alt-tabbing. Priority mode is configurable: Item Completion, Most Set Value, Most Plat, or Most Ducats.

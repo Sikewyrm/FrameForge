@@ -178,6 +178,14 @@ export default function MarketHelper({ quantities, apiQuantities, refreshKey, cr
     invoke<CatalogItem[]>("get_all_items").then(setAllItems).catch(() => {});
   }, [refreshKey]);
 
+  // Reflect WFM login state immediately — App.tsx loads the JWT into Rust on startup,
+  // so wfm_get_session succeeds even before the Trading tab has been opened.
+  useEffect(() => {
+    invoke<[string, string] | null>("wfm_get_session")
+      .then(existing => { if (existing) setWfmUsername(existing[0]); })
+      .catch(() => {});
+  }, []); // eslint-disable-line
+
   // Load cached prices from localStorage on startup
   useEffect(() => {
     try {

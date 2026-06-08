@@ -267,3 +267,216 @@
   flex-shrink: 0;
 }
 .riven-next-roll-btn:hover { background: rgba(56,139,253,.25); }
+
+/* ── Stat value inputs ── */
+.riven-value-inputs {
+  background: rgba(0,0,0,.2);
+  border: 1px solid rgba(48,54,61,.5);
+  border-radius: 6px;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.riven-value-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.riven-value-label {
+  flex: 1;
+  font-size: 12px;
+  color: var(--text);
+  min-width: 160px;
+}
+.riven-value-neg { color: var(--red); }
+.riven-value-input {
+  width: 72px;
+  background: rgba(0,0,0,.3);
+  border: 1px solid rgba(48,54,61,.6);
+  border-radius: 4px;
+  padding: 3px 6px;
+  color: var(--text);
+  font-size: 12px;
+  text-align: right;
+}
+.riven-value-input:focus { outline: none; border-color: var(--accent); }
+.riven-value-unit { font-size: 11px; color: var(--muted); width: 14px; }
+.riven-save-btn {
+  background: rgba(56,139,253,.15);
+  border: 1px solid rgba(56,139,253,.4);
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 4px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background .1s;
+}
+.riven-save-btn:hover { background: rgba(56,139,253,.28); }
+
+/* ── Saved rolls ── */
+.riven-saved-section {
+  border-top: 1px solid rgba(48,54,61,.5);
+  padding-top: 12px;
+  flex-shrink: 0;
+}
+.riven-saved-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 8px;
+}
+.riven-saved-card {
+  background: rgba(0,0,0,.25);
+  border: 1px solid rgba(48,54,61,.5);
+  border-radius: 7px;
+  padding: 9px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  transition: border-color .1s;
+}
+.riven-saved-card:hover { border-color: rgba(48,54,61,.9); }
+.riven-saved-selected { border-color: var(--accent) !important; background: rgba(56,139,253,.06) !important; }
+.riven-saved-header {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: 3px;
+}
+.riven-saved-label-input {
+  flex: 1;
+  background: none;
+  border: none;
+  border-bottom: 1px solid transparent;
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 0 2px;
+  min-width: 0;
+}
+.riven-saved-label-input:focus { outline: none; border-bottom-color: var(--accent); }
+.riven-saved-actions { display: flex; gap: 3px; flex-shrink: 0; }
+.riven-saved-compare-btn {
+  background: none;
+  border: 1px solid rgba(48,54,61,.6);
+  border-radius: 3px;
+  color: var(--muted);
+  font-size: 10px;
+  width: 20px; height: 20px;
+  cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  transition: all .1s;
+}
+.riven-saved-compare-btn:hover { border-color: var(--accent); color: var(--accent); }
+.riven-saved-compare-btn.active { background: rgba(56,139,253,.2); border-color: var(--accent); color: var(--accent); }
+.riven-saved-delete-btn {
+  background: none;
+  border: 1px solid rgba(48,54,61,.6);
+  border-radius: 3px;
+  color: var(--muted);
+  font-size: 10px;
+  width: 20px; height: 20px;
+  cursor: pointer;
+  transition: all .1s;
+}
+.riven-saved-delete-btn:hover { border-color: var(--red); color: var(--red); }
+.riven-saved-stats { display: flex; flex-direction: column; gap: 2px; }
+.riven-saved-stat { font-size: 11px; color: var(--muted); display: flex; gap: 4px; }
+
+/* ── Comparison panel ── */
+.riven-compare-panel {
+  margin-top: 12px;
+  background: rgba(0,0,0,.2);
+  border: 1px solid rgba(56,139,253,.3);
+  border-radius: 7px;
+  padding: 10px 12px;
+}
+.riven-compare-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+.riven-compare-col {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.riven-compare-label {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text);
+  margin-bottom: 4px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid rgba(48,54,61,.4);
+}
+
+/* ── Sign & format toggles ── */
+.riven-sign-btn {
+  min-width: 22px; height: 22px;
+  border-radius: 4px;
+  border: 1px solid;
+  font-size: 13px; font-weight: 700;
+  cursor: pointer; flex-shrink: 0;
+  transition: all .1s;
+}
+.sign-pos { background: rgba(63,185,80,.15); border-color: rgba(63,185,80,.5); color: #3fb950; }
+.sign-pos:hover { background: rgba(63,185,80,.3); }
+.sign-neg { background: rgba(248,81,73,.12); border-color: rgba(248,81,73,.5); color: #f85149; }
+.sign-neg:hover { background: rgba(248,81,73,.25); }
+
+.riven-fmt-btn {
+  min-width: 24px; height: 22px;
+  background: rgba(255,255,255,.06); border: 1px solid rgba(48,54,61,.7);
+  border-radius: 4px; color: var(--muted); font-size: 11px; font-weight: 600;
+  cursor: pointer; flex-shrink: 0;
+  transition: background .1s;
+}
+.riven-fmt-btn:hover { background: rgba(255,255,255,.12); }
+
+.riven-cancel-edit-btn {
+  background: none; border: 1px solid rgba(48,54,61,.6); border-radius: 4px;
+  color: var(--muted); font-size: 11px; padding: 4px 8px; cursor: pointer;
+  transition: border-color .1s;
+}
+.riven-cancel-edit-btn:hover { border-color: var(--red); color: var(--red); }
+
+.riven-saved-edit-btn {
+  background: none; border: 1px solid rgba(48,54,61,.6); border-radius: 3px;
+  color: var(--muted); font-size: 11px; width: 20px; height: 20px;
+  cursor: pointer; transition: all .1s;
+}
+.riven-saved-edit-btn:hover { border-color: var(--accent); color: var(--accent); }
+
+/* ── Alternative build cards ── */
+.riven-alternatives {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.riven-alt-card {
+  background: rgba(0,0,0,.2);
+  border: 1px solid rgba(48,54,61,.5);
+  border-radius: 7px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.riven-alt-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.riven-alt-label {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  color: var(--muted);
+  background: rgba(255,255,255,.06);
+  border-radius: 3px;
+  padding: 2px 6px;
+}

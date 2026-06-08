@@ -8,8 +8,7 @@ import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 // Stored OUTSIDE React so StrictMode remounts don't destroy/recreate the window.
 let _rivenWin: WebviewWindow | null = null;
 let _rivenRollCount = 0;
-// _rivenLastTriggerMs removed — re-add when auto-detection is re-enabled
-// Exposed so the "Check Riven" button can trigger from anywhere without the 4s cooldown
+let _rivenLastTriggerMs = 0;
 let _rivenManualTrigger: (() => void) | null = null;
 export function checkRivenNow() { _rivenManualTrigger?.(); }
 
@@ -433,6 +432,8 @@ export default function App() {
   // ── WFM auto-login at app start ───────────────────────────────────────────
   // Restores the session into Rust's AppState so the Trading tab is instantly
   // ready when the user opens it — no need to visit the tab first.
+  // Also pre-warms the top-items cache in the background so the Statistics tab
+  // loads instantly rather than running ~2 minutes of API calls on first open.
   useEffect(() => {
     (async () => {
       const creds = await invoke<[string, string] | null>("wfm_load_credentials").catch(() => null);
@@ -440,6 +441,8 @@ export default function App() {
         invoke("wfm_set_jwt", { jwt: creds[1] }).catch(() => {}); // silent — failure just means re-login on tab open
       }
     })();
+    // Fire-and-forget: populates WFM_TOP_CACHE so the Statistics tab is instant
+    invoke("get_wfm_top_items").catch(() => {});
   }, []); // eslint-disable-line
 
   // ── Bootstrap ──────────────────────────────────────────────────────────────
@@ -853,13 +856,9 @@ export default function App() {
       localStorage.setItem("ff-api-mod-copies", JSON.stringify(apiModCopies));
   }, [apiModCopies]);
 
-  useEffect(() => { if (settingsLoadedRef.current) saveAllSettings(); }, [tracked]);              // eslint-disable-line
-  useEffect(() => { if (settingsLoadedRef.current) saveAllSettings(); }, [favorites]);             // eslint-disable-line
-  useEffect(() => { if (settingsLoadedRef.current) saveAllSettings(); }, [modularWidth]);          // eslint-disable-line
-  useEffect(() => { if (settingsLoadedRef.current) saveAllSettings(); }, [memoryScannerEnabled]);  // eslint-disable-line
-  useEffect(() => { if (settingsLoadedRef.current) saveAllSettings(); }, [companionApiEnabled]);   // eslint-disable-line
-  useEffect(() => { if (settingsLoadedRef.current) saveAllSettings(); }, [modularSectionOrder]); // eslint-disable-line
-  useEffect(() => { if (settingsLoadedRef.current) saveAllSettings(); }, [modularPopout]); // eslint-disable-line
+  useEffect(() => {
+    if (settingsLoadedRef.current) saveAllSettings();
+  }, [tracked, favorites, modularWidth, memoryScannerEnabled, companionApiEnabled, modularSectionOrder, modularPopout]); // eslint-disable-line
 
   // ── Modular pop-out window ─────────────────────────────────────────────────
   useEffect(() => {
@@ -949,7 +948,7 @@ export default function App() {
   useEffect(() => {
     // Core OCR + overlay display. Called manually via button or (future) auto-detection.
     const runRivenCheck = async () => {
-      void 0; // _rivenLastTriggerMs = Date.now() — for auto-detection cooldown when re-enabled
+      _rivenLastTriggerMs = Date.now();
       _rivenRollCount++;
       const { emit } = await import("@tauri-apps/api/event");
 
@@ -965,8 +964,9 @@ export default function App() {
         await emit("riven-scanning-start", {}).catch(() => {});
         windowReady = true;
       } else if (result?.fresh) {
-        // Fresh window — send data when it's ready
-        result.win.once("tauri://created", async () => {
+        // Fresh window — send data once its listener signals ready
+        const unsubReady = await listen("riven-window-ready", async () => {
+          unsubReady();
           windowReady = true;
           if (pendingPayload) { await emit("riven-analysis-update", pendingPayload).catch(() => {}); pendingPayload = null; }
         });
@@ -994,44 +994,25 @@ export default function App() {
     // overlay "Start Comparison" button emits this event
     const unsubManual = listen("riven-manual-check", () => runRivenCheck().catch(() => {}));
 
-    // Auto-detection (disabled) — kept here to re-enable later
-    const unsubAutoDetect = listen("riven-screen-open", async () => {
-      // TODO: re-enable when auto-detection is reliable
-      // const now = Date.now();
-      // if (now - _rivenLastTriggerMs < 4000) return;
-      // runRivenCheck();
-    });
+    // Open trigger: EE.log watcher fires "riven-screen-open" via FindFirstChangeNotificationW
+    // (instant file-write notification — no polling delay).
+    // 4 s cooldown prevents double-fires from the same log buffer flush.
+    const triggerOpen = () => {
+      const now = Date.now();
+      if (now - _rivenLastTriggerMs < 4000) return;
+      runRivenCheck().catch(() => {});
+    };
+    const unsubAutoDetect = listen("riven-screen-open", () => triggerOpen());
 
-    const unsubClose   = listen("riven-screen-close",  () => rivenWinHide("screen-close"));
+    // Close triggers: EE.log (DiegeticArtifactCards HudVis 0) + manual dismiss.
+    const unsubClose   = listen("riven-screen-close",   () => rivenWinHide("screen-close"));
     const unsubHideReq = listen<{ reason?: string }>("riven-overlay-hide", e => rivenWinHide(e.payload?.reason ?? "overlay-hide"));
-
-    let pollMissCount = 0;
-    let unknownCount = 0;
-    let pollActive = false;
-    const pollInterval = setInterval(async () => {
-      if (!_rivenWin || pollActive) return;
-      pollActive = true;
-      try {
-        const timeout = new Promise<string>(r => setTimeout(() => r("unknown"), 3000));
-        const status  = await Promise.race([invoke<string>("riven_screen_status").catch(() => "unknown"), timeout]);
-        if (status === "open") {
-          pollMissCount = 0; unknownCount = 0;
-        } else if (status === "closed") {
-          pollMissCount++; unknownCount = 0;
-          if (pollMissCount >= 10) { pollMissCount = 0; rivenWinHide("poll-10-closed-misses"); }
-        } else {
-          pollMissCount = 0; unknownCount++;
-          if (unknownCount >= 20) { unknownCount = 0; rivenWinHide("poll-unknown-40s"); }
-        }
-      } finally { pollActive = false; }
-    }, 2000);
 
     return () => {
       unsubManual.then(fn => fn());
       unsubAutoDetect.then(fn => fn());
       unsubClose.then(fn => fn());
       unsubHideReq.then(fn => fn());
-      clearInterval(pollInterval);
       _rivenManualTrigger = null;
     };
   }, []); // eslint-disable-line
@@ -1197,55 +1178,71 @@ export default function App() {
     return [...set].sort((a, b) => a - b);
   }, [apiModCopies]);
 
-  const categoryCounts = useMemo(() => {
-    const owned: Record<string, number> = { all: 0 };
+  // Total counts only depend on the catalog — stable until item list is refreshed.
+  const categoryTotals = useMemo(() => {
     const total: Record<string, number> = { all: catalog.length };
+    for (const item of catalog) total[item.category] = (total[item.category] ?? 0) + 1;
+    return total;
+  }, [catalog]);
+
+  // Owned counts depend on quantities — recalculates every inventory scan.
+  const categoryOwned = useMemo(() => {
+    const owned: Record<string, number> = { all: 0 };
     for (const item of catalog) {
-      total[item.category] = (total[item.category] ?? 0) + 1;
       if ((mergedQty[item.unique_name] ?? 0) > 0) {
-        owned.all = (owned.all ?? 0) + 1;
+        owned.all++;
         owned[item.category] = (owned[item.category] ?? 0) + 1;
       }
     }
-    return { owned, total };
+    return owned;
   }, [catalog, mergedQty]);
+
+  const categoryCounts = useMemo(
+    () => ({ owned: categoryOwned, total: categoryTotals }),
+    [categoryOwned, categoryTotals]
+  );
 
   const visibleItems = useMemo(() => {
     const q = search.toLowerCase();
-    return catalog
-      .filter(i => i.name !== "Blueprint")
-      .filter(i => category === "all" || i.category === category)
-      .filter(i => !q || i.name.toLowerCase().includes(q))
-      .filter(i => !filterOwned    || (mergedQty[i.unique_name] ?? 0) > 0)
-      .filter(i => !filterRecent   || lastChanged[i.unique_name] != null)
-      .filter(i => !filterPrime    || i.name.includes("Prime") || i.vaulted != null)
-      .filter(i => !filterVaulted  || i.vaulted === true)
-      .filter(i => !filterUnvaulted|| i.vaulted === false)
-      .filter(i => {
-        if (filterRank === null) return true;
-        const isMod = i.category === "Mods" || i.category === "Arcanes";
-        if (!isMod) return true;
-        const copies = modCopiesMap[i.unique_name];
-        if (!copies) return false;
-        if (filterRank === "unranked") return copies.some(c => c.rank === null || c.rank === 0);
-        return copies.some(c => c.rank === filterRank);
-      })
-      .map(i => ({ ...i, qty: mergedQty[i.unique_name] ?? 0 }))
-      .sort((a, b) => {
-        if (sortMode === "recent") {
-          const at = lastChanged[a.unique_name] ?? 0;
-          const bt = lastChanged[b.unique_name] ?? 0;
-          return bt - at || a.name.localeCompare(b.name);
+    const out: (CatalogItem & { qty: number })[] = [];
+    for (const i of catalog) {
+      if (i.name === "Blueprint") continue;
+      if (category !== "all" && i.category !== category) continue;
+      if (q && !i.name.toLowerCase().includes(q)) continue;
+      const qty = mergedQty[i.unique_name] ?? 0;
+      if (filterOwned    && qty === 0) continue;
+      if (filterRecent   && lastChanged[i.unique_name] == null) continue;
+      if (filterPrime    && !i.name.includes("Prime") && i.vaulted == null) continue;
+      if (filterVaulted  && i.vaulted !== true) continue;
+      if (filterUnvaulted && i.vaulted !== false) continue;
+      if (filterRank !== null) {
+        if (i.category === "Mods" || i.category === "Arcanes") {
+          const copies = modCopiesMap[i.unique_name];
+          if (!copies) continue;
+          if (filterRank === "unranked") {
+            if (!copies.some(c => c.rank === null || c.rank === 0)) continue;
+          } else {
+            if (!copies.some(c => c.rank === filterRank)) continue;
+          }
         }
-        const aOwned = a.qty > 0 ? 1 : 0;
-        const bOwned = b.qty > 0 ? 1 : 0;
-        if (bOwned !== aOwned) return bOwned - aOwned;
-        if (sortMode === "name-asc")  return a.name.localeCompare(b.name);
-        if (sortMode === "name-desc") return b.name.localeCompare(a.name);
-        if (sortMode === "qty-asc")   return a.qty - b.qty || a.name.localeCompare(b.name);
-        return b.qty - a.qty || a.name.localeCompare(b.name);
-      })
-      .slice(0, 1000);
+      }
+      out.push({ ...i, qty });
+    }
+    out.sort((a, b) => {
+      if (sortMode === "recent") {
+        const at = lastChanged[a.unique_name] ?? 0;
+        const bt = lastChanged[b.unique_name] ?? 0;
+        return bt - at || a.name.localeCompare(b.name);
+      }
+      const aOwned = a.qty > 0 ? 1 : 0;
+      const bOwned = b.qty > 0 ? 1 : 0;
+      if (bOwned !== aOwned) return bOwned - aOwned;
+      if (sortMode === "name-asc")  return a.name.localeCompare(b.name);
+      if (sortMode === "name-desc") return b.name.localeCompare(a.name);
+      if (sortMode === "qty-asc")   return a.qty - b.qty || a.name.localeCompare(b.name);
+      return b.qty - a.qty || a.name.localeCompare(b.name);
+    });
+    return out.slice(0, 1000);
   }, [catalog, mergedQty, category, search, filterOwned, filterRecent, filterPrime, filterVaulted, filterUnvaulted, filterRank, sortMode, lastChanged, modCopiesMap]); // eslint-disable-line
 
   // ─── Render ─────────────────────────────────────────────────────────────────
@@ -1983,6 +1980,7 @@ export default function App() {
             <Statistics />
           </ErrorBoundary>
         )}
+
 
         {/* ── Modular Window — always visible unless popped out ── */}
         {!modularPopout && <ModularWindow

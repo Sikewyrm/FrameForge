@@ -4,6 +4,23 @@ import { listen, emit } from "@tauri-apps/api/event";
 // Tells App.tsx to run OCR again (for "Check New Roll" / "Start Comparison")
 const triggerNewCheck = () => emit("riven-manual-check", {}).catch(() => {});
 
+// Save current roll directly from overlay
+async function saveOverlayRoll(
+  weapon: string,
+  stats: { name: string; value: string; positive: boolean }[],
+  verdict: string, score: number, rollCount: number
+) {
+  if (!weapon || stats.length === 0) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  const now = new Date();
+  const label = `${weapon.charAt(0).toUpperCase() + weapon.slice(1)} · Roll #${rollCount} · ${now.getDate()} ${now.toLocaleString("en",{month:"short"})}`;
+  await invoke("save_riven_roll", {
+    weapon, label, statsJson: JSON.stringify(stats), verdict, score,
+  }).catch(() => {});
+  const { emit } = await import("@tauri-apps/api/event");
+  await emit("riven-roll-saved").catch(() => {});
+}
+
 import "./RivenOverlayWindow.css";
 
 // No auto-hide — user dismisses with ✕ or the poll detects screen closure.
@@ -15,6 +32,8 @@ const requestHide = (reason: string) => {
   emit("riven-overlay-hide", { reason }).catch(() => {});
 };
 
+interface AlternativeResult { label: string; matched: string[]; missing: string[]; score: number; verdict: string; }
+
 interface RivenAnalysis {
   weapon: string;
   matched_positives: string[];
@@ -25,6 +44,7 @@ interface RivenAnalysis {
   score: number;
   verdict: string;
   notes: string;
+  alternatives: AlternativeResult[];
 }
 
 interface RolledStat {
@@ -62,6 +82,7 @@ export default function RivenOverlayWindow() {
   const [parsedWeapon, setParsedWeapon] = useState("");
   const [rollCount, setRollCount]       = useState(0);
   const [scanning, setScanning]         = useState(true);
+  const [saved, setSaved]               = useState(false);
   const scanTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const resetToScanning = () => {
@@ -101,6 +122,9 @@ export default function RivenOverlayWindow() {
       // Reset emergency fallback timer — 60 min from last data shown
       scanTimerRef.current = setTimeout(() => requestHide("emergency-60min"), 3_600_000);
     });
+
+    // Tell App.tsx the listener is registered and the pending payload can be sent now.
+    emit("riven-window-ready", {}).catch(() => {});
 
     // Initial hide fallback — same as resetToScanning's timer
     scanTimerRef.current = setTimeout(() => requestHide("emergency-60min"), 3_600_000);
@@ -165,10 +189,18 @@ export default function RivenOverlayWindow() {
         {/* Header */}
         <div className="rov-header">
           <span className="rov-title">{displayName}</span>
-          {rollCount > 0 && <span className="rov-roll">Roll #{rollCount}</span>}
           <button className="rov-compare-btn" onClick={() => triggerNewCheck()} title="Re-scan (use after cycling for comparison)">
             {isComparison ? "🔄 Refresh" : "⚡ New Roll"}
           </button>
+          {rolledStats.length > 0 && (
+            <button className="rov-save-btn" title="Save this roll"
+              onClick={async () => {
+                await saveOverlayRoll(weaponName, rolledStats, analysis?.verdict ?? "", analysis?.score ?? 0, rollCount);
+                setSaved(true); setTimeout(() => setSaved(false), 2000);
+              }}>
+              {saved ? "✓" : "💾"}
+            </button>
+          )}
           <button className="rov-close-btn" onClick={() => requestHide("x-button")} title="Dismiss">✕</button>
         </div>
 
@@ -188,15 +220,43 @@ export default function RivenOverlayWindow() {
         {/* Result */}
         {!scanning && (rolledStats.length > 0 || analysis) && (
           <>
-            {/* Verdict + score */}
-            {analysis && (
-              <>
-                <div className="rov-verdict" style={{ color: verdictColor(analysis.verdict) }}>
-                  {analysis.verdict}
+            {/* One analysis card per build alternative */}
+            {analysis && analysis.alternatives.map((alt, i) => (
+              <div key={i} className="rov-alt-card">
+                {analysis.alternatives.length > 1 && (
+                  <span className="rov-alt-label">{alt.label}</span>
+                )}
+                <div className="rov-verdict" style={{ color: verdictColor(alt.verdict) }}>
+                  {alt.verdict}
                 </div>
-                <ScoreBar score={analysis.score} />
-              </>
-            )}
+                <ScoreBar score={alt.score} />
+                {/* Negatives shown once on first card */}
+                {i === 0 && analysis.safe_negatives_present.map(s => (
+                  <div key={s} className="rov-stat-row rov-stat-safeneg">
+                    <span className="rov-stat-icon">✓</span>
+                    <span className="rov-stat-name">−{s}</span>
+                    <span className="rov-stat-value" style={{fontSize:10}}>Safe</span>
+                  </div>
+                ))}
+                {i === 0 && analysis.harmful_negatives.map(s => (
+                  <div key={s} className="rov-stat-row rov-stat-harmful">
+                    <span className="rov-stat-icon">✗</span>
+                    <span className="rov-stat-name">−{s}</span>
+                    <span className="rov-stat-value" style={{fontSize:10}}>Harmful</span>
+                  </div>
+                ))}
+                {alt.missing.length > 0 && (
+                  <div className="rov-missing">
+                    <span className="rov-missing-label">Wanted: </span>
+                    {alt.missing.map((s, j) => (
+                      <span key={s} className="rov-missing-stat">
+                        {s}{j < alt.missing.length - 1 ? ", " : ""}
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </div>
+            ))}
 
             {/* Rolled stats — what's actually on the card */}
             {rolledStats.length > 0 && (
@@ -234,17 +294,6 @@ export default function RivenOverlayWindow() {
               </div>
             )}
 
-            {/* Wanted stats not rolled — compact list at bottom */}
-            {analysis && analysis.missing_positives.length > 0 && (
-              <div className="rov-missing">
-                <span className="rov-missing-label">Wanted: </span>
-                {analysis.missing_positives.map((s, i) => (
-                  <span key={s} className="rov-missing-stat">
-                    {s}{i < analysis.missing_positives.length - 1 ? ", " : ""}
-                  </span>
-                ))}
-              </div>
-            )}
 
             {/* No DB entry */}
             {!analysis && rolledStats.length > 0 && (
