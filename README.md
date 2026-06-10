@@ -1,4 +1,4 @@
-# FrameForge — Warframe Companion `v1.6.0`
+# FrameForge — Warframe Companion `v1.7.0`
 
 A desktop companion for Warframe that shows your live inventory, tracks crafting recipes, displays market prices, runs a full trading desk, manages a live timer dashboard, auto-detects relic reward screens, and analyses riven mods — all without modifying the game.
 
@@ -42,7 +42,7 @@ A live dashboard fetching data directly from DE's official Warframe worldstate:
 - **Events** — Baro Ki'Teer with expandable inventory (Ducat/Credit prices + Owned badges), Prime Resurgence with expandable inventory (Aya prices + Owned badges), Nightwave, Darvo daily deal, active community events
 - **Alerts** — mission type, faction, reward, countdown
 - **Invasions** — attacker/defender factions, progress bar, rewards
-- **Void Fissures** — Normal, Steel Path, and Void Storm tabs as a grid of tiles. Watched fissures highlighted in blue.
+- **Void Fissures** — Normal, Steel Path, and Void Storm tabs as a grid of tiles. Watched fissures highlighted in blue. Supports all mission types including Assault, Void Cascade, Void Flood, and Alchemy.
 - **Fissure Watches** — configure Mode + Tier + Mission Type filters; matching fissures are highlighted in the fissure list and auto-surfaced in the Modular Window
 
 Any timer can be pinned to the Modular Window for at-a-glance viewing.
